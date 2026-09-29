@@ -15,7 +15,8 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        改腳本裡的路徑。轉錄固定使用 Whisper large-v3。
     4. 可以一次拖多個檔案，會自動排隊依序處理。
     5. 用雙擊啟動時沒有終端機視窗可以看錯誤訊息，所有錯誤都會寫進腳本
-       同資料夾下的 whisper_app.log，啟動失敗也會跳出訊息框提示。
+       同資料夾下的 whisper_app.log（那個資料夾不能寫入時改放在系統暫存資料夾），
+       啟動失敗也會跳出訊息框提示。
     6. 勾選「時間戳對齊」時，Whisper 轉錄完後會再用日文 wav2vec2 模型做
        CTC 強制對齊，把每條字幕的起訖時間校正到實際開口／收尾的位置。
        對齊模型第一次使用會自動從 Hugging Face 下載（約 1.2 GB）。
@@ -34,38 +35,66 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        到第一句字幕出現為止的空白字幕。有些剪輯軟體匯入 SRT 時會把第一條字幕放在
        播放頭的位置，有這條空白字幕墊在 0 秒，把播放頭放在影片開頭再匯入就能對齊。
        只對齊模式也適用；輸入的 .srt 裡原本就有的空白字幕會先拿掉再重新加，不會變兩條。
+   10. 需要 Python 3.9 以上。輸出資料夾（output_dir）和人聲分離的暫存資料夾（separation_work_dir）
+       預設在 D:\桌面\whisper 底下；建立不起來（例如這台電腦沒有 D 槽）時，會自動改用腳本旁邊的
+       text／separated 資料夾，實際用到哪裡會寫在視窗開啟後日誌的第一行。
 """
+
+from __future__ import annotations   # 讓 int | None、list[str] 這類標註在 Python 3.9 也能載入
 
 import sys
 import os
+import tempfile
 import traceback
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "whisper_app.log"
+
+# 啟動時發生、值得讓使用者知道的事（例如改用了備用資料夾），視窗開起來後寫進日誌
+STARTUP_NOTES: list[str] = []
+
+
+def _open_log_file():
+    """log 檔預設放在腳本旁邊；那個資料夾不能寫入（例如裝在 Program Files）就改放到暫存資料夾。"""
+    for folder in (BASE_DIR, Path(tempfile.gettempdir())):
+        path = folder / "whisper_app.log"
+        try:
+            return path, open(path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            continue
+    return None, open(os.devnull, "w", encoding="utf-8")
+
 
 # 用 pythonw 雙擊啟動時沒有終端機，sys.stdout / sys.stderr 會是 None，
 # 任何 print 或例外訊息原本會直接消失甚至報錯，所以先一律導向同一個 log 檔。
-_log_stream = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+LOG_FILE, _log_stream = _open_log_file()
 sys.stdout = _log_stream
 sys.stderr = _log_stream
+if LOG_FILE is None:
+    STARTUP_NOTES.append("!!! 找不到可以寫入的位置，這次不會留下 whisper_app.log")
+elif LOG_FILE.parent != BASE_DIR:
+    STARTUP_NOTES.append(f"注意：腳本資料夾不能寫入，日誌檔改放在 {LOG_FILE}")
 
 
 def _show_fatal_error(message: str):
     """啟動失敗或執行中發生未捕捉例外時，跳出訊息框告知使用者。"""
     traceback.print_exc()
+    title = "Whisper 字幕產生器 - 發生錯誤"
+    text = message + (f"\n\n詳細錯誤已寫入：\n{LOG_FILE}" if LOG_FILE else "")
     try:
         import tkinter as _tk
         from tkinter import messagebox as _mb
         _root = _tk.Tk()
         _root.withdraw()
-        _mb.showerror(
-            "Whisper 字幕產生器 - 發生錯誤",
-            f"{message}\n\n詳細錯誤已寫入：\n{LOG_FILE}",
-        )
+        _mb.showerror(title, text)
         _root.destroy()
     except Exception:
-        pass
+        # tkinter 本身載入失敗（例如安裝 Python 時沒有勾 tcl/tk）：改用 Windows 內建的訊息框
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
+        except Exception:
+            pass
 
 
 try:
@@ -75,7 +104,6 @@ try:
     import queue
     import re
     import json
-    import tempfile
     import collections
     import unicodedata
 
@@ -103,6 +131,8 @@ SEPARATION_MODEL = "htdemucs"     # htdemucs_ft 是 4 個模型的組合，記�
 SEPARATION_SEGMENT = 7            # htdemucs 是 Transformer 架構，硬性上限 7.8 秒，不能設更大
                                    # 只能往下調（例如 5）來進一步省記憶體；設 None 則不加此參數
 
+# 偏好的資料夾。建立不起來（例如這台電腦沒有 D 槽）會自動改用腳本旁邊的 text／separated，
+# 實際用到的位置會寫進視窗開啟後日誌的第一行。
 output_dir = r"D:\桌面\whisper\text"
 separation_work_dir = r"D:\桌面\whisper\separated"
 
@@ -203,8 +233,32 @@ ATTACH_NEXT_WORDS = ("そして", "それから", "それで", "だから", "で
 #   下一條字幕不要用這些單獨的助詞開頭（例如「最近 / はゲーム」這種切法）
 NO_START_PARTICLES = {"は", "が", "を", "に", "の", "も", "と", "へ", "や", "よ", "ね", "か", "な", "わ", "さ", "で"}
 
-os.makedirs(output_dir, exist_ok=True)
-os.makedirs(separation_work_dir, exist_ok=True)
+
+def _ensure_dir(preferred: str, name: str, label: str) -> str:
+    """
+    建立 preferred 資料夾並回傳實際可用的路徑。建不起來就依序改用腳本旁邊的 <name>、
+    使用者家目錄下的 whisper_subtitles/<name>，並在 STARTUP_NOTES 記下改用了哪裡。
+    """
+    candidates = [Path(preferred), BASE_DIR / name,
+                  Path(os.path.expanduser("~")) / "whisper_subtitles" / name]
+    for i, folder in enumerate(candidates):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"無法建立{label}資料夾 {folder}：{e}")
+            continue
+        if i > 0:
+            STARTUP_NOTES.append(f"注意：{label}資料夾 {preferred} 建立不起來，改用 {folder}")
+        return str(folder)
+    raise OSError(f"{label}資料夾建立失敗：{preferred}（也試過 {candidates[1]}、{candidates[2]}）")
+
+
+try:
+    output_dir = _ensure_dir(output_dir, "text", "輸出")
+    separation_work_dir = _ensure_dir(separation_work_dir, "separated", "人聲分離暫存")
+except Exception:
+    _show_fatal_error("無法建立輸出資料夾。請檢查 w1_1.py 裡 output_dir／separation_work_dir 的路徑。")
+    raise
 
 logging.basicConfig()
 logging.getLogger("faster_whisper").setLevel(logging.DEBUG)
@@ -1151,6 +1205,8 @@ class App:
         self.ui_queue = queue.Queue()
         threading.Thread(target=self.worker_loop, daemon=True).start()
         self.root.after(100, self.poll_ui_queue)
+        for note in STARTUP_NOTES:
+            self.log(note)
 
     # ---- 視窗大小：依螢幕大小決定，不會超出螢幕 ----
     def _px(self, n: float) -> int:
