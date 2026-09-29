@@ -66,19 +66,20 @@ def is_blank_text(text: str) -> bool:
     return not _INVISIBLE_RE.sub("", text)
 
 
-def add_leading_blank(subs: list[dict], log_func) -> None:
+def add_leading_blank(subs: list[dict], log_func, origin: float = 0.0) -> None:
     """
     在最前面插入一條從 00:00:00,000 開始、到第一句字幕出現為止的空白字幕（原地修改）。
     結束點剛好是第一句的起點，不會蓋到任何字幕。
+    origin = 時間軸的起點：字幕來自時間軸從 01:00:00 開始的剪輯軟體時，空白字幕從那裡開始，不是從 0。
     """
     if not subs:
         return
     first_start = min(sub["start"] for sub in subs)
-    if first_start < config.LEADING_BLANK_MIN_SEC:
+    if first_start - origin < config.LEADING_BLANK_MIN_SEC:
         log_func("第一句字幕從影片開頭就開始了，不需要插入空白字幕")
         return
-    subs.insert(0, {"start": 0.0, "end": first_start, "text": config.LEADING_BLANK_TEXT})
-    log_func(f"已在最前面插入空白字幕（00:00:00,000 --> {format_timestamp(first_start)}）")
+    subs.insert(0, {"start": origin, "end": first_start, "text": config.LEADING_BLANK_TEXT})
+    log_func(f"已在最前面插入空白字幕（{format_timestamp(origin)} --> {format_timestamp(first_start)}）")
 
 
 def write_srt(path, segments: list[dict]):

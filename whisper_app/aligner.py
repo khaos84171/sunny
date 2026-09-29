@@ -13,6 +13,8 @@ from faster_whisper import decode_audio
 
 from . import config
 from .jobs import JOBS, _NO_WINDOW, _child_env, _console_python
+from .srt_io import format_timestamp
+from .timing import detect_timeline_offset
 
 
 class AlignServer:
@@ -95,19 +97,40 @@ class AlignServer:
 ALIGN_SERVER = AlignServer()
 
 
-def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func) -> dict:
+def _shift_result(result: dict, offset: float) -> dict:
+    """把對齊結果的所有時間加上 offset 秒（把「影片的時間軸」換回「字幕原本的時間軸」）。"""
+    def shift_pairs(pairs):
+        return None if pairs is None else [None if p is None else [p[0] + offset, p[1] + offset] for p in pairs]
+    result["spans"] = [None if s is None else [s[0] + offset, s[1] + offset] for s in result["spans"]]
+    result["word_spans"] = [shift_pairs(w) for w in result["word_spans"]]
+    return result
+
+
+def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func, detect_offset: bool = False) -> dict:
     """
     呼叫 align_worker.py 用 wav2vec2 強制對齊。
     segments: [{"start", "end", "text", "words"(可省略，list[Word])}, ...]
-    回傳 {"duration", "spans", "confs", "wide", "word_spans", "checks"}，每個 list 都跟 segments 一樣長；
+    回傳 {"duration", "offset", "spans", "confs", "wide", "word_spans", "checks"}，每個 list 都跟 segments 一樣長；
     個別片段對不上時該項是 None，不會整份失敗。
+    detect_offset=True（只對齊現有字幕時用）：字幕的時間軸整個差了整數小時（剪輯軟體匯出的字幕常從 01:00:00 開始）
+    就先扣掉再對齊，回傳的時間（含 duration）換回字幕原本的時間軸，offset 是扣掉的秒數（沒有偏移 = 0.0）。
+    字幕跟影片明顯對不起來時丟 ValueError。
     """
     if not config.ALIGN_WORKER.exists():
         raise FileNotFoundError(f"找不到 {config.ALIGN_WORKER.name}，請把它放在 {config.BASE_DIR}")
 
     log_func(f"[對齊] 讀取音訊：{audio_path}")
-    audio = decode_audio(audio_path, sampling_rate=config.SAMPLE_RATE)
+    audio = JOBS.run_interruptibly(decode_audio, audio_path, sampling_rate=config.SAMPLE_RATE)  # 長影片要解碼好幾秒
     duration = len(audio) / config.SAMPLE_RATE
+
+    offset = detect_timeline_offset(segments, duration) if detect_offset else 0.0
+    if offset:
+        log_func(f"[對齊] 字幕的時間軸從 {format_timestamp(offset)} 開始（剪輯軟體常見的時間軸起點），"
+                 f"先整體提早 {offset / 3600:g} 小時再對齊；輸出的字幕維持原本的時間軸")
+    elif detect_offset:
+        late = sum(1 for s in segments if s["start"] >= duration)
+        if late:
+            log_func(f"[對齊] 注意：有 {late} 條字幕的起點超過影片長度（{format_timestamp(duration)}），這些沒辦法對齊")
 
     with tempfile.TemporaryDirectory(prefix="whisper_align_") as tmp:
         tmp = Path(tmp)
@@ -121,7 +144,7 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
             "audio_npy": str(audio_npy),
             "segments": [
                 {
-                    "start": s["start"], "end": s["end"], "text": s["text"],
+                    "start": s["start"] - offset, "end": s["end"] - offset, "text": s["text"],
                     # 有詞的切法就一起送，worker 會傳回每個詞對齊後的時間（給拆分用）
                     "words": [w.word for w in s["words"]] if s.get("words") else None,
                 }
@@ -158,19 +181,23 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
                 detail += "\n（align_worker.py 是舊版，請把它跟 w1_1.py 一起更新）"
             raise RuntimeError(f"對齊程序失敗（代碼 {returncode}）：\n{detail}")
 
-        result = json.loads(result_json.read_text(encoding="utf-8"))
+        raw = json.loads(result_json.read_text(encoding="utf-8"))
 
     n = len(segments)
-    spans = result["spans"]
-    if len(spans) != n:
-        raise RuntimeError(f"對齊結果數量不符（送出 {n} 條，收到 {len(spans)} 條）")
-    return {
+    if len(raw["spans"]) != n:
+        raise RuntimeError(f"對齊結果數量不符（送出 {n} 條，收到 {len(raw['spans'])} 條）")
+    result = {
         "duration": duration,
-        "spans": spans,
-        "confs": result.get("confs") or [None] * n,
-        "wide": result.get("wide") or [False] * n,
+        "offset": offset,
+        "spans": raw["spans"],
+        "confs": raw.get("confs") or [None] * n,
+        "wide": raw.get("wide") or [False] * n,
         # 舊版 align_worker.py 沒有這一項：拆分會退回用 Whisper 的詞時間
-        "word_spans": result.get("word_spans") or [None] * n,
+        "word_spans": raw.get("word_spans") or [None] * n,
         # 每個詞的聲音交叉檢查 [起點狀態, 起點修正秒數, 終點狀態, 終點修正秒數]；舊版 align_worker.py 沒有
-        "checks": result.get("checks") or [None] * n,
+        "checks": raw.get("checks") or [None] * n,
     }
+    if offset:
+        _shift_result(result, offset)
+        result["duration"] += offset
+    return result

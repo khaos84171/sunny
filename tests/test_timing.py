@@ -126,6 +126,64 @@ def test_apply_alignment_accepts_a_result_from_an_old_worker_without_checks():
     assert segs[0]["checks"] is None and segs[0]["aligned"] is True
 
 
+# ---------------- detect_timeline_offset ----------------
+def lines_at(*starts):
+    return [{"start": s, "end": s + 1.5, "text": "x"} for s in starts]
+
+
+def test_offset_is_zero_for_a_normal_subtitle_file():
+    assert timing.detect_timeline_offset(lines_at(1, 30, 200, 1000), duration=1200) == 0.0
+
+
+def test_editor_timeline_starting_at_one_hour_is_detected():
+    """DaVinci Resolve／Final Cut 的時間軸預設從 01:00:00:00 開始，匯出的字幕整個晚了一小時。"""
+    assert timing.detect_timeline_offset(lines_at(3600 + 3.9, 3600 + 63.9, 3600 + 1138), duration=1200) == 3600.0
+
+
+def test_other_whole_hour_starts_are_detected_too():
+    assert timing.detect_timeline_offset(lines_at(36000 + 5, 36000 + 300), duration=600) == 36000.0
+    assert timing.detect_timeline_offset(lines_at(7200 + 5, 7200 + 300), duration=600) == 7200.0
+
+
+def test_the_largest_fitting_whole_hour_is_used():
+    """從 02:00:00 開始的字幕、影片有 66 分鐘：扣掉 1 小時（落在 60～66 分）和扣掉 2 小時（落在 0～5 分）都放得進去，
+    字幕從影片最開頭附近開始才合理，所以取最大的。"""
+    assert timing.detect_timeline_offset(lines_at(7200 + 10, 7200 + 100, 7200 + 300), duration=4000) == 7200.0
+    assert timing.detect_timeline_offset(lines_at(3600 + 10, 3600 + 3000, 3600 + 4000), duration=4500) == 3600.0   # 影片較長：只有 1 小時放得下
+
+
+def test_a_video_that_really_is_long_is_not_shifted():
+    """影片真的有 2 小時，字幕從 1 小時之後才開始講話（前面沒人說話）：不是偏移，不能亂扣。"""
+    assert timing.detect_timeline_offset(lines_at(3700, 4000, 6000), duration=7200) == 0.0
+
+
+def test_a_few_lines_past_the_end_do_not_trigger_a_shift():
+    starts = list(range(10, 1000, 10)) + [5000, 5010]                # 影片被截短了：少數字幕超過影片長度
+    assert timing.detect_timeline_offset(lines_at(*starts), duration=1000) == 0.0
+
+
+def test_mostly_inside_but_trimmed_video_is_processed_normally():
+    """一半以上還落在影片裡（影片被截短）：照常處理，不丟錯。"""
+    starts = list(range(10, 1000, 10))[:60] + [5000 + i for i in range(30)]
+    assert timing.detect_timeline_offset(lines_at(*starts), duration=1000) == 0.0
+
+
+def test_subtitles_that_cannot_be_matched_to_the_video_raise_a_helpful_error():
+    with pytest.raises(ValueError) as e:
+        timing.detect_timeline_offset(lines_at(5000, 5100, 5200, 5300), duration=600)      # 差 1 小時多，不是整數小時
+    message = str(e.value)
+    assert "01:23:20,000" in message and "00:10:00,000" in message and "對不起來" in message and "00:59:50" in message
+
+
+def test_subtitles_longer_than_the_video_even_after_shifting_are_rejected():
+    with pytest.raises(ValueError):
+        timing.detect_timeline_offset(lines_at(3600, 3700, 3800, 3900, 4000), duration=100)
+
+
+def test_offset_detection_with_nothing_to_align():
+    assert timing.detect_timeline_offset([], duration=100) == 0.0
+
+
 # ---------------- report_alignment ----------------
 def test_report_lists_unaligned_low_confidence_and_big_shifts(monkeypatch):
     segs = [

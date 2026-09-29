@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import atexit
 import os
+import queue
 import subprocess
 import sys
 import threading
 from pathlib import Path
+
+
+CANCEL_POLL_SEC = 0.1   # 等一個停不下來的工作時，每隔多久看一次有沒有被取消（也就是取消最慢的反應時間）
 
 
 class JobCancelled(Exception):
@@ -71,6 +75,78 @@ class JobControl:
             procs = list(self._procs)
         for proc in procs:
             _kill_tree(proc)
+
+    def run_interruptibly(self, fn, *args, **kwargs):
+        """
+        跑一個一旦開始就停不下來的呼叫（載入 Whisper 模型、解碼整段音訊…它們在主程式裡面跑，沒辦法像子程序一樣殺掉）。
+        工作交給背景執行緒，這裡每 CANCEL_POLL_SEC 秒看一次有沒有被取消：取消了就馬上丟出 JobCancelled，
+        不用等它做完；它自己在背景跑完就算了，結果直接丟掉。沒被取消就回傳 fn 的結果，fn 丟的例外也照樣丟出來。
+        """
+        self.check()  # 已經取消了就不用開始
+        box = queue.Queue(maxsize=1)
+
+        def target():
+            try:
+                box.put((True, fn(*args, **kwargs)))
+            except BaseException as e:  # 連同例外一起交給等的那一邊
+                box.put((False, e))
+
+        threading.Thread(target=target, name="interruptible-call", daemon=True).start()
+        while True:
+            try:
+                ok, value = box.get(timeout=CANCEL_POLL_SEC)
+            except queue.Empty:
+                self.check()
+                continue
+            if ok:
+                return value
+            raise value
+
+    def iter_interruptibly(self, iterable):
+        """
+        逐項取出 iterable（例如 Whisper 一段一段吐出來的轉錄結果），做法跟 run_interruptibly 一樣：
+        產生下一項的過程在背景執行緒裡跑，這裡等的時候一直看有沒有被取消。
+        被取消（或呼叫端提早離開）時，背景那一邊做完手上這一項就不再往下做，並把 iterable 收掉。
+        """
+        items = queue.Queue()
+        stop = threading.Event()
+        done = object()
+
+        def pump():
+            it = iter(iterable)
+            try:
+                while not stop.is_set():
+                    try:
+                        item = next(it)
+                    except StopIteration:
+                        items.put((done, None))
+                        return
+                    items.put((True, item))
+            except BaseException as e:
+                items.put((False, e))
+            finally:
+                close = getattr(it, "close", None)  # generator 只能由執行它的這個執行緒收掉
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=pump, name="interruptible-iter", daemon=True).start()
+        try:
+            while True:
+                try:
+                    tag, value = items.get(timeout=CANCEL_POLL_SEC)
+                except queue.Empty:
+                    self.check()
+                    continue
+                if tag is done:
+                    return
+                if not tag:
+                    raise value
+                yield value
+        finally:
+            stop.set()
 
     def spawn(self, cmd, **kwargs):
         proc = subprocess.Popen(cmd, **kwargs)

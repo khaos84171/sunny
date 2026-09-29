@@ -341,9 +341,6 @@ class App:
         ttk.Label(
             status_row, textvariable=self.status_var, style="Status.TLabel",
         ).pack(side="left")
-        ttk.Button(
-            status_row, text="取消處理", style="Small.RedOutline.TButton", command=self.cancel_all,
-        ).pack(side="right")
 
         self.progress = ttk.Progressbar(
             inner, mode="determinate", maximum=100, style="Red.Horizontal.TProgressbar",
@@ -453,6 +450,13 @@ class App:
             font=(Theme.FONT_FAMILY, 16, "bold"), width=2, height=1,
         )
         mark.pack(side="left", padx=(0, 10))
+
+        # 取消按鈕放在最上方橫幅的右側，而且要先於標題文字排版：pack 是先排的先分到空間，
+        # 視窗縮小、標題或狀態文字再長，也只會擠到標題，按鈕永遠看得到
+        self.cancel_button = ttk.Button(
+            inner, text="取消處理", style="RedOutline.TButton", command=self.cancel_all,
+        )
+        self.cancel_button.pack(side="right", padx=(10, 0))
 
         text_col = tk.Frame(inner, bg=Theme.RED)
         text_col.pack(side="left", fill="x", expand=True)

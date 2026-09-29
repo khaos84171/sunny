@@ -1,4 +1,6 @@
 """完整處理流程：轉錄 → 幻覺過濾 → 對齊 → 拆分 → 輸出 SRT；進度條分配；輸出檔名；取消。"""
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -25,12 +27,12 @@ class FakeModel:
         return iter(self.segments), types.SimpleNamespace(duration=100.0, duration_after_vad=90.0)
 
 
-def fake_align(audio, segments, log, progress):
+def fake_align(audio, segments, log, progress, detect_offset=False):
     progress(0.5)
     progress(1.0)
     n = len(segments)
-    return {"duration": 100.0, "spans": [[s["start"], s["end"]] for s in segments], "confs": [0.9] * n, "wide": [False] * n,
-            "word_spans": [None] * n}
+    return {"duration": 100.0, "offset": 0.0, "spans": [[s["start"], s["end"]] for s in segments], "confs": [0.9] * n,
+            "wide": [False] * n, "word_spans": [None] * n}
 
 
 @pytest.fixture
@@ -151,9 +153,9 @@ def test_align_only_never_separates_vocals(monkeypatch, tmp_path):
     srt.write_text("1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n", encoding="utf-8")
     aligned_inputs = []
 
-    def recording_align(audio, segments, log_func, progress_func):
+    def recording_align(audio, segments, log_func, progress_func, detect_offset=False):
         aligned_inputs.append(audio)
-        return fake_align(audio, segments, log_func, progress_func)
+        return fake_align(audio, segments, log_func, progress_func, detect_offset)
 
     def no_separation(*a, **k):
         raise AssertionError("只對齊不該做人聲分離")
@@ -161,6 +163,25 @@ def test_align_only_never_separates_vocals(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "separate_vocals", no_separation)
     pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, lambda p: None)
     assert aligned_inputs == ["/x/影片.mp4"]
+
+
+def test_align_only_asks_for_offset_detection_and_keeps_the_srt_timeline(monkeypatch, tmp_path):
+    """剪輯軟體匯出的字幕從 01:00:00 開始：對齊完仍然是那條時間軸，空白字幕也從 01:00:00 開始。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n01:00:02,000 --> 01:00:04,000\nこんにちは\n\n2\n01:00:06,000 --> 01:00:08,000\nさようなら\n", encoding="utf-8")
+    seen = {}
+
+    def align_with_offset(audio, segments, log, progress, detect_offset=False):
+        seen["detect_offset"] = detect_offset
+        n = len(segments)
+        return {"duration": 100.0 + 3600.0, "offset": 3600.0, "spans": [[s["start"] + 0.1, s["end"] - 0.1] for s in segments],
+                "confs": [0.9] * n, "wide": [False] * n, "word_spans": [None] * n}
+    monkeypatch.setattr(pipeline, "run_alignment", align_with_offset)
+    out = pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, lambda p: None, add_blank=True)
+    text = Path(out).read_text(encoding="utf-8")
+    assert seen["detect_offset"] is True
+    assert text.startswith("1\n01:00:00,000 --> 01:00:02,100\n\u200b\n\n2\n01:00:02,100 --> ")
+    assert "01:00:06,100" in text and text.count("-->") == 3
 
 
 def test_align_only_rejects_srt_without_subtitles(tmp_path):
@@ -192,3 +213,41 @@ def test_cancellation_is_not_swallowed_as_an_alignment_failure(stub, monkeypatch
     monkeypatch.setattr(pipeline, "run_alignment", cancelled)
     with pytest.raises(JobCancelled):
         stub.run(use_align=True)
+
+
+@pytest.mark.parametrize("stuck_at", ["載入模型", "解碼音訊與 VAD", "解碼一個視窗"])
+def test_cancel_does_not_wait_for_whisper_wherever_it_is_stuck(stub, monkeypatch, stuck_at):
+    """Whisper 在主程式裡跑、殺不掉：卡在哪一步，按取消都要馬上停下來，之後也不能再寫日誌或輸出檔案。"""
+    release = threading.Event()
+    info = types.SimpleNamespace(duration=100.0, duration_after_vad=90.0)
+
+    class StuckModel(FakeModel):
+        def transcribe(self, path, **kw):
+            if stuck_at == "解碼音訊與 VAD":
+                release.wait(10)
+
+            def gen():
+                yield Seg(0, 10, "こんにちは")
+                if stuck_at == "解碼一個視窗":
+                    release.wait(10)
+                yield Seg(10, 20, "もう一句")
+            return gen(), info
+
+    def get_model(log):
+        if stuck_at == "載入模型":
+            release.wait(10)
+        return StuckModel()
+    monkeypatch.setattr(pipeline, "get_model", get_model)
+    logs = []
+    JOBS.begin(JOBS.generation)
+    threading.Timer(0.3, JOBS.cancel).start()
+    t0 = time.time()
+    try:
+        with pytest.raises(JobCancelled):
+            pipeline.process_file("/x/影片.mp4", False, False, True, [], logs.append, lambda f: None, add_blank=False)
+        assert time.time() - t0 < 2                        # 沒有等到 release：不必等 Whisper 做完
+    finally:
+        release.set()
+    time.sleep(0.3)                                        # 讓背景那邊做完，確認它不會再影響到已取消的這個檔案
+    assert not any("もう一句" in x for x in logs)
+    assert not list(Path(runtime.output_dir).glob("*.srt"))

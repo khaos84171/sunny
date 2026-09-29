@@ -21,19 +21,19 @@ python -m pytest tests
 |---|---|
 | `test_srt_io.py` | SRT 時間格式、各種編碼、多行字幕、開頭空白字幕 |
 | `test_splitter.py` | 字幕拆分：句尾標點、停頓、長度上限、右括號、不切在詞中間（有／沒有 janome） |
-| `test_timing.py` | 對齊後的時間微調（不推遲下一條）、套用對齊結果、檢查報告 |
+| `test_timing.py` | 對齊後的時間微調（不推遲下一條）、套用對齊結果、檢查報告、字幕時間軸整個差整數小時的偵測（剪輯軟體匯出的字幕） |
 | `test_dropped.py`, `test_settings_store.py` | 拖進來的東西整理、設定檔讀寫 |
-| `test_jobs.py` | 取消與子程序管理 |
+| `test_jobs.py` | 取消與子程序管理；可中斷的等待（Whisper 在主程式裡跑、殺不掉，按取消要「不等它」） |
 | `test_separation.py` | Demucs：呼叫方式、進度、快取（含殘檔）、取消、找 Demucs 的順序（用 `fakes/demucs`） |
 | `test_transcribe.py` | GPU 偵測與 CPU 備援、Whisper 模型載入、幻覺片語過濾 |
-| `test_pipeline.py` | 完整流程、進度條分配、輸出檔名、取消 |
+| `test_pipeline.py` | 完整流程、進度條分配、輸出檔名、取消（Whisper 卡在載入模型／解碼音訊／解碼視窗，都要馬上停） |
 | `test_align_worker.py` | `align_worker.py`：結果不變（`golden/`）、frame 時間換算、常駐模式、顯存搬移、萬用字元、CTC |
 | `test_align_refine.py` | 用聲音能量微調邊界 + 交叉驗證：用合成音訊（真正的起訖已知）驗證邊界貼回去、背景太吵／連續語音時不亂動、不越過鄰居、聽不到聲音的詞會被點名 |
 | `test_accuracy_e2e.py` | 端到端：合成音訊 → 真的 worker 子程序（假模型照劇本放帶偏差的 CTC 尖峰）→ SRT → 跟標準答案比誤差，比較「只用 CTC」與「聲音微調」 |
 | `test_evaluate.py` | 評估工具 `python -m whisper_app.evaluate`：配對、誤差統計、K 折交叉驗證、建議設定值、命令列 |
 | `test_aligner.py` | 主程式這一側的對齊程序管理（重用、逾時、取消、出錯、重試） |
 | `test_runtime.py` | log 輪替、輸出資料夾與備用位置、啟動失敗的訊息框 |
-| `test_gui.py` | 設定記憶、Hotwords 預設、日誌視窗、取消／佇列／拖放、錯誤回報、關閉視窗、DPI |
+| `test_gui.py` | 設定記憶、Hotwords 預設、日誌視窗、取消／佇列／拖放（取消按鈕在頂部橫幅、視窗縮到最小仍看得到）、錯誤回報、關閉視窗、DPI |
 | `test_startup.py` | 入口 `w1_1.py` 的啟動保護（缺套件資料夾、缺必要套件、正常載入、重複開啟會安靜地結束） |
 | `test_vbs.py`（`vbs_lint.py`） | `字幕產生器.vbs` 的靜態檢查：純 ASCII／CRLF、區塊配對、`Option Explicit` 下的變數宣告，以及它試跑 Python 用的結束碼約定。Linux 上沒辦法真的執行 .vbs，所以只能檢查到這裡 |
 
