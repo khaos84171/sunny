@@ -162,7 +162,7 @@ ALIGN_MAX_INNER_GAP = 1.0    # 第二輪結果若同一句相鄰兩字空超過�
 ALIGN_START_LEAD_SEC = 0.0   # 字幕比第一個字提早多少秒出現（想讓字幕早一點點出來可設 0.05～0.1）
 ALIGN_BIG_SHIFT_SEC = 1.0    # 對齊後起點移動超過這麼多秒的字幕會列在日誌裡，建議確認
 ALIGN_END_HOLD_SEC = 0.25    # 對齊後的結束點剛好落在最後一個字，稍微延長讓字幕不會一閃就消失（不會蓋到下一句）
-ALIGN_MIN_DURATION = 0.3     # 單條字幕最短顯示秒數
+ALIGN_MIN_DURATION = 0.3     # 單條字幕最短顯示秒數（後面緊接下一條、空隙不夠時就不延長，不會推遲下一條）
 ALIGN_LOW_CONF = 0.3         # 對齊信心低於這個值的字幕會列在日誌裡，建議人工檢查
 SAMPLE_RATE = 16000
 
@@ -180,6 +180,8 @@ SPLIT_MAX_DURATION = 7.0     # 單條字幕最長幾秒
 SPLIT_MIN_CHARS = 2          # 依長度切時，兩邊至少要有幾個字（避免切出只有一個字的碎片）
 SPLIT_MIN_DISPLAY_SEC = 0.3  # 沒做對齊時，拆出來的字幕最短顯示秒數
 SENTENCE_END_CHARS = "。．！？!?♪"
+# 句尾標點後面可以緊跟的右括號／引號：切點要放在它們後面，不然「」」會跑到下一條開頭
+CLOSING_CHARS = "」』）)】〕］]”’"
 
 # === 開頭空白字幕設定（方便匯入剪輯軟體時對軸）===
 # 內容用「零寬空格」：畫面上看不到，但不會像真正的空白一樣被剪輯軟體或 SRT 解析器
@@ -470,7 +472,9 @@ def report_alignment(segments: list[dict], subs: list[dict], log_func):
 
 def finalize_aligned_timing(subs: list[dict], duration: float):
     """
-    對齊後的後處理：稍微提早出現、不重疊、最短顯示時間、結尾稍微延長（但不蓋到下一句）。
+    對齊後的後處理：稍微提早出現、不重疊、最短顯示時間、結尾稍微延長。
+    最短顯示時間與結尾延長都只用到跟下一句之間的空隙：不會蓋到下一句，
+    也不會把下一句的起點往後推（空隙不夠就少延長，寧可短一點）。
     先把所有起點提早，再處理重疊與延長，後一句提早的空間才不會被前一句的延長吃掉。
     """
     for sub in subs:
@@ -479,9 +483,12 @@ def finalize_aligned_timing(subs: list[dict], duration: float):
     for i, sub in enumerate(subs):
         if i > 0 and sub["start"] < subs[i - 1]["end"]:
             sub["start"] = subs[i - 1]["end"]
-        sub["end"] = max(sub["end"], sub["start"] + ALIGN_MIN_DURATION)
         next_start = subs[i + 1]["start"] if i + 1 < len(subs) else duration
-        sub["end"] = min(sub["end"] + ALIGN_END_HOLD_SEC, max(next_start, sub["end"]))
+        want = max(sub["end"], sub["start"] + ALIGN_MIN_DURATION) + ALIGN_END_HOLD_SEC
+        sub["end"] = max(sub["end"], min(want, next_start))
+        if sub["end"] <= sub["start"]:
+            # 前一句蓋過了整句的極端情況：至少給最短顯示時間，後一句的起點下一輪會被推開
+            sub["end"] = sub["start"] + ALIGN_MIN_DURATION
 
 
 # =========================================================
@@ -693,7 +700,7 @@ def _heuristic_can_break(left_text: str, right_word: str) -> bool:
     a, b = left_text.rstrip(), right_word.lstrip()
     if not a or not b:
         return True
-    if b[0] in "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶーｰ゛゜" or b in PARTICLE_SURFACES:
+    if b[0] in "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶーｰ゛゜" or b[0] in CLOSING_CHARS or b in PARTICLE_SURFACES:
         return False
     ca, cb = _char_class(a[-1]), _char_class(b[0])
     if ca == cb and ca in ("kanji", "katakana", "alnum") and not right_word[:1].isspace():
@@ -733,6 +740,25 @@ def _words_text(words) -> str:
 def _last_char(word) -> str:
     t = word.word.strip()
     return t[-1] if t else ""
+
+
+def _sentence_end_flags(words) -> list[bool]:
+    """
+    每個詞是不是「句子在這裡結束」。句尾標點後面緊跟右括號／引號時，句尾記在最後一個
+    括號上（。」→ 切在」之後）；標點跟括號黏在同一個詞裡（。」）也認得。
+    """
+    flags = []
+    for w in words:
+        t = w.word.strip()
+        core = t.rstrip(CLOSING_CHARS)
+        if core:
+            flags.append(core[-1] in SENTENCE_END_CHARS)
+        elif t and flags:  # 這個詞只有括號：沿用前一個詞的句尾狀態，切點往後移
+            flags[-1], moved = False, flags[-1]
+            flags.append(moved)
+        else:
+            flags.append(False)
+    return flags
 
 
 def _too_long(words) -> bool:
@@ -802,12 +828,13 @@ def split_segment(seg: dict) -> list[dict]:
         return [{"start": seg["start"], "end": seg["end"], "text": seg["text"]}]
 
     ok = _allowed_cuts(words)  # 哪些位置是文節交界（不會切在一個詞的中間）
+    ends = _sentence_end_flags(words)  # 哪些詞是句尾（已把後面的右括號算進去）
 
     # 第 1、2 步：句尾標點 → 切；明顯停頓而且剛好在文節交界 → 切
     groups, start = [], 0
     for i in range(len(words) - 1):
         w, nxt = words[i], words[i + 1]
-        if _last_char(w) in SENTENCE_END_CHARS:
+        if ends[i]:
             cut = True
         else:
             cut = (ok[i] and nxt.start - w.end >= SPLIT_PAUSE_SEC

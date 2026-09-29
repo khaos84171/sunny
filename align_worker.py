@@ -149,7 +149,8 @@ def ctc_align(log_probs: np.ndarray, tokens: list[int], blank_id: int):
     states = np.empty(T, dtype=np.int64)
     for t in range(T - 1, -1, -1):
         states[t] = s
-        s -= backptr[t, s]
+        # 轉成 Python int：NumPy 2 下 int 減 int8 的結果會被當成 int8，s > 127 就溢位
+        s -= int(backptr[t, s])
 
     is_tok = states % 2 == 1
     frames = np.nonzero(is_tok)[0]
