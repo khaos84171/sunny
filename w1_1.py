@@ -38,6 +38,8 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
    10. 需要 Python 3.9 以上。輸出資料夾（output_dir）和人聲分離的暫存資料夾（separation_work_dir）
        預設在 D:\桌面\whisper 底下；建立不起來（例如這台電腦沒有 D 槽）時，會自動改用腳本旁邊的
        text／separated 資料夾，實際用到哪裡會寫在視窗開啟後日誌的第一行。
+   11. 人聲分離用獨立程序跑 Demucs（不會跳出黑色視窗，進度會顯示在進度條和日誌裡）。結果存在
+       separation_work_dir 底下，同一個檔案（大小與修改時間沒變）再處理時直接重用。
 """
 
 from __future__ import annotations   # 讓 int | None、list[str] 這類標註在 Python 3.9 也能載入
@@ -99,6 +101,10 @@ def _show_fatal_error(message: str):
 
 try:
     import logging
+    import codecs
+    import hashlib
+    import importlib.util
+    import shutil
     import subprocess
     import threading
     import queue
@@ -130,6 +136,7 @@ SEPARATION_MODEL = "htdemucs"     # htdemucs_ft 是 4 個模型的組合，記�
                                    # 若記憶體充足想換回更高品質版本，可改成 "htdemucs_ft"
 SEPARATION_SEGMENT = 7            # htdemucs 是 Transformer 架構，硬性上限 7.8 秒，不能設更大
                                    # 只能往下調（例如 5）來進一步省記憶體；設 None 則不加此參數
+SEPARATION_PROGRESS_SHARE = 0.25  # 有勾人聲分離時，分離佔進度條的前多少比例（轉錄、對齊縮進剩下的部分）
 
 # 偏好的資料夾。建立不起來（例如這台電腦沒有 D 槽）會自動改用腳本旁邊的 text／separated，
 # 實際用到的位置會寫進視窗開啟後日誌的第一行。
@@ -277,39 +284,148 @@ def format_timestamp(seconds: float) -> str:
 Word = collections.namedtuple("Word", "start end word")
 
 
+_PROGRESS_RE = re.compile(r"(\d{1,3})%\|")   # tqdm 進度條的樣子：「 45%|████▌     | …」
+
+
+def _iter_console_lines(stream):
+    """
+    逐行讀子程序的輸出（bytes）。tqdm 進度條是用「回到行首」的方式原地更新的，
+    所以回車字元也當作換行，不然整條進度會擠成一行、等到結束才讀得到。
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    buf = ""
+    while True:
+        chunk = stream.read1(4096)
+        if not chunk:
+            break
+        parts = re.split(r"[\r\n]+", buf + decoder.decode(chunk))
+        buf = parts.pop()
+        for part in parts:
+            if part.strip():
+                yield part
+    buf += decoder.decode(b"", final=True)
+    if buf.strip():
+        yield buf
+
+
+def _wav_is_complete(path: Path) -> bool:
+    """
+    WAV 檔頭記的音訊長度是不是真的都寫進檔案了。輸出到一半被中斷的檔案，
+    檔頭記的長度會是 0 或比實際檔案大，這種不能當成已經分離好的結果。
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+                return False
+            pos = 12
+            while True:
+                chunk_head = f.read(8)
+                if len(chunk_head) < 8:
+                    return False
+                chunk_id, chunk_size = chunk_head[:4], int.from_bytes(chunk_head[4:], "little")
+                if chunk_id == b"data":
+                    return chunk_size > 0 and pos + 8 + chunk_size <= size
+                pos += 8 + chunk_size + (chunk_size & 1)  # 每個區塊都對齊到偶數位元組
+                f.seek(pos)
+    except OSError:
+        return False
+
+
+def _demucs_command() -> list[str]:
+    """
+    啟動 Demucs 的指令前半段。優先用「跑這個程式的同一個 Python」的 demucs（python -m demucs.separate），
+    這樣用 .vbs 的 PYTHONW_PATH 指定虛擬環境時也找得到；那個環境沒裝 demucs 才退回 PATH 上的 demucs。
+    """
+    if importlib.util.find_spec("demucs") is not None:
+        return [_console_python(), "-m", "demucs.separate"]
+    exe = shutil.which("demucs")
+    if exe:
+        return [exe]
+    raise FileNotFoundError("找不到 Demucs。請在執行這個程式的同一個 Python 環境裡執行 pip install demucs"
+                            f"（目前用的 Python：{sys.executable}）")
+
+
 def separate_vocals(input_path: str, work_dir: str, log_func,
                      device: str = "cuda", model_name: str = "htdemucs",
-                     segment: int | None = None) -> str:
+                     segment: int | None = None, progress_func=None) -> str:
     """
-    用 Demucs 分離人聲與背景音樂，回傳人聲音軌路徑。
-    若該檔案已經分離過，直接重用現有結果，不重跑（分離很耗時）。
+    用 Demucs 分離人聲與背景音樂，回傳人聲音軌路徑。分離很耗時，所以同一個檔案分離過就直接重用：
+        結果放在 <work_dir>/<模型>/<檔名>__<來源檔大小與修改時間的雜湊>/vocals.wav，
+        同名但內容不同的檔案（a.mp4 和 a.mkv、重新剪過的版本）不會共用到彼此的結果。
+        Demucs 先輸出到暫存資料夾，確認檔案完整才搬進來，中途被中斷不會留下半個檔案被當成完成。
+        舊版放在 <檔名>/vocals.wav 的結果，只要檔案完整、而且比來源檔新，也會沿用。
+    progress_func(0～1) 回報分離進度（從 Demucs 輸出的進度條讀取），沒給就不回報。
     """
     input_path = Path(input_path)
-    base = input_path.stem
-    vocals_path = Path(work_dir) / model_name / base / "vocals.wav"
+    report = progress_func or (lambda frac: None)
+    source = input_path.stat()
+    key = hashlib.sha1(f"{source.st_size}:{source.st_mtime_ns}".encode()).hexdigest()[:8]
+    model_dir = Path(work_dir) / model_name
+    final_dir = model_dir / f"{input_path.stem}__{key}"
+    legacy_path = model_dir / input_path.stem / "vocals.wav"
 
-    if vocals_path.exists():
-        log_func(f"[人聲分離] 已存在分離結果，跳過分離：{vocals_path}")
-        return str(vocals_path)
+    for cached, must_be_newer in ((final_dir / "vocals.wav", False), (legacy_path, True)):
+        if (cached.exists() and _wav_is_complete(cached)
+                and (not must_be_newer or cached.stat().st_mtime >= source.st_mtime)):
+            log_func(f"[人聲分離] 已存在分離結果，跳過分離：{cached}")
+            report(1.0)
+            return str(cached)
 
-    log_func(f"[人聲分離] 開始處理：{input_path.name}（這步驟可能需要幾分鐘，視音訊長度與裝置而定）")
-    cmd = [
-        "demucs",
+    tmp_out = Path(work_dir) / f"_partial_{key}"
+    shutil.rmtree(tmp_out, ignore_errors=True)  # 上次中斷留下的
+    cmd = _demucs_command() + [
         "--two-stems", "vocals",
         "-n", model_name,
         "-d", device,
-        "-o", str(work_dir),
+        "-o", str(tmp_out),
         str(input_path),
     ]
     if segment is not None:
         cmd += ["--segment", str(segment)]
-    subprocess.run(cmd, check=True)
 
-    if not vocals_path.exists():
-        raise FileNotFoundError(f"分離完成但找不到輸出檔案：{vocals_path}")
+    log_func(f"[人聲分離] 開始處理：{input_path.name}（這步驟可能需要幾分鐘，視音訊長度與裝置而定）")
+    print(f"[人聲分離] 指令：{' '.join(cmd)}")
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=_child_env(), creationflags=_NO_WINDOW,
+        )
+        tail = collections.deque(maxlen=15)
+        last_pct = -1
+        for line in _iter_console_lines(proc.stdout):
+            m = _PROGRESS_RE.search(line)
+            if m:
+                pct = min(int(m.group(1)), 100)
+                if pct != last_pct:
+                    last_pct = pct
+                    report(pct / 100)
+                continue
+            line = line.strip()
+            print(line)
+            log_func("[人聲分離] " + line)
+            tail.append(line)
+        returncode = proc.wait()
+        if returncode != 0:
+            detail = "\n".join(tail) if tail else "（沒有輸出）"
+            raise RuntimeError(f"Demucs 人聲分離失敗（代碼 {returncode}）：\n{detail}")
 
-    log_func(f"[人聲分離] 完成，人聲音軌：{vocals_path}")
-    return str(vocals_path)
+        produced = next(iter((tmp_out / model_name).glob("*/vocals.wav")), None)
+        if produced is None or not _wav_is_complete(produced):
+            raise FileNotFoundError(f"Demucs 已結束，但找不到完整的人聲檔：{tmp_out / model_name}")
+        shutil.rmtree(final_dir, ignore_errors=True)  # 前一次留下的不完整結果
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(produced.parent, final_dir)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        shutil.rmtree(tmp_out, ignore_errors=True)
+
+    report(1.0)
+    log_func(f"[人聲分離] 完成，人聲音軌：{final_dir / 'vocals.wav'}")
+    return str(final_dir / "vocals.wav")
 
 
 # === 模型快取：第一次轉錄時載入，之後一直重用 ===
@@ -342,6 +458,14 @@ def build_hotwords(words: list[str]) -> str:
 # 「Could not load symbol cudnnGetLibConfig. Error code 127」，所以對齊跟 Demucs 一樣
 # 用獨立程序跑，主程式完全不 import torch。
 ALIGN_WORKER = BASE_DIR / "align_worker.py"
+
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows：不要為子程序跳出黑色 cmd 視窗
+
+
+def _child_env(**extra) -> dict:
+    """子程序的環境變數：輸出一律用 UTF-8，主程式才不會讀到亂碼。"""
+    return dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", **extra)
 
 
 def _console_python() -> str:
@@ -399,14 +523,13 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
             },
         }, ensure_ascii=False), encoding="utf-8")
 
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
-                   HF_HUB_DISABLE_SYMLINKS_WARNING="1")
+        env = _child_env(HF_HUB_DISABLE_SYMLINKS_WARNING="1")
         log_func("[對齊] 啟動對齊程序…")
         proc = subprocess.Popen(
             [_console_python(), str(ALIGN_WORKER), str(job_json), str(result_json)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=_NO_WINDOW,
         )
         tail = collections.deque(maxlen=15)
         for line in proc.stdout:
@@ -639,12 +762,17 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
     log_func(f"讀到 {len(segments)} 條字幕"
              + (f"（另有 {n_blank} 條空白字幕，已略過）" if n_blank else ""))
 
+    # 有做人聲分離時，分離佔進度條的前一段，對齊縮進剩下的部分
+    overall_progress = progress_func
     if use_sep:
         audio_input = separate_vocals(
             str(media_path), separation_work_dir, log_func,
             device=SEPARATION_DEVICE, model_name=SEPARATION_MODEL,
             segment=SEPARATION_SEGMENT,
+            progress_func=lambda frac: overall_progress(SEPARATION_PROGRESS_SHARE * frac),
         )
+        progress_func = lambda frac: overall_progress(
+            SEPARATION_PROGRESS_SHARE + (1 - SEPARATION_PROGRESS_SHARE) * frac)
     else:
         audio_input = str(media_path)
 
@@ -930,12 +1058,17 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         f"時間戳對齊 = {'是' if use_align else '否'}、自動拆分 = {'是' if use_split else '否'}"
     )
 
+    # 有做人聲分離時，分離佔進度條的前一段，轉錄與對齊縮進剩下的部分
+    overall_progress = progress_func
     if use_sep:
         transcribe_input = separate_vocals(
             str(input_path), separation_work_dir, log_func,
             device=SEPARATION_DEVICE, model_name=SEPARATION_MODEL,
             segment=SEPARATION_SEGMENT,
+            progress_func=lambda frac: overall_progress(SEPARATION_PROGRESS_SHARE * frac),
         )
+        progress_func = lambda frac: overall_progress(
+            SEPARATION_PROGRESS_SHARE + (1 - SEPARATION_PROGRESS_SHARE) * frac)
     else:
         transcribe_input = str(input_path)
 
