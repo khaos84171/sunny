@@ -50,20 +50,94 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        轉錄時會略過 Whisper 在靜音或背景音樂上編出來的固定片語（例如「ご視聴ありがとうございました」），
        被略過的每一筆都寫在日誌，不需要時把 FILTER_HALLUCINATIONS 改成 False。
        沒有勾「自動拆分」時，輸出檔名結尾會多一個 _nosplit，不會蓋掉有拆分的版本。
+   14. 視窗上的勾選狀態和 Hotwords 會記在腳本旁邊的 whisper_settings.json，下次開啟沿用；
+       第一次開啟時「人名」都不勾、「通用詞」預設勾選（人名每部影片不同，不相關的反而會干擾辨識）。
+       whisper_app.log 超過 2 MB 會換檔（只留最近 3 份舊的），日誌視窗最多留 LOG_MAX_LINES 行，
+       往上捲動看舊訊息時不會被新訊息拉回底部。螢幕縮放大於 100% 時視窗不再被系統放大而變模糊。
 """
 
 from __future__ import annotations   # 讓 int | None、list[str] 這類標註在 Python 3.9 也能載入
 
+import io
 import sys
 import os
 import tempfile
+import threading
 import traceback
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# log 檔超過這個大小就換檔（whisper_app.log → .log.1 → .log.2 …），只留最近幾份，不會無限長大
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 3
+
 # 啟動時發生、值得讓使用者知道的事（例如改用了備用資料夾），視窗開起來後寫進日誌
 STARTUP_NOTES: list[str] = []
+
+
+class _RotatingLog(io.TextIOBase):
+    """
+    log 檔。sys.stdout / sys.stderr 都導向這裡；檔案超過 max_bytes 就換檔，只保留最近 backups 份舊的。
+    多個執行緒同時寫不會交錯；壞掉的字元（例如檔名裡的孤立代理字元）寫成跳脫文字，不會讓寫入出錯。
+    """
+
+    def __init__(self, path, max_bytes: int, backups: int):
+        self._path = Path(path)
+        self._max_bytes = max_bytes
+        self._backups = backups
+        self._lock = threading.Lock()
+        self._size = 0
+        self._file = self._open()
+        if self._size >= self._max_bytes:  # 上次留下來的已經太大
+            self._rotate()
+
+    def _open(self):
+        f = open(self._path, "a", encoding="utf-8", errors="backslashreplace", buffering=1)
+        self._size = os.path.getsize(self._path)
+        return f
+
+    def _rotate(self) -> None:
+        self._file.close()
+        try:
+            for i in range(self._backups - 1, 0, -1):
+                older = self._path.with_name(f"{self._path.name}.{i}")
+                if older.exists():
+                    os.replace(older, self._path.with_name(f"{self._path.name}.{i + 1}"))
+            if self._backups > 0:
+                os.replace(self._path, self._path.with_name(f"{self._path.name}.1"))
+            else:
+                self._path.unlink()
+        except OSError:
+            pass  # 檔案被別的程序占著（例如同時開了兩個視窗）換不了：繼續往原檔寫
+        self._file = self._open()
+        if self._size >= self._max_bytes:
+            self._size = 0  # 換檔失敗：等再寫滿一輪才重試，不要每寫一行就試一次
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        with self._lock:
+            self._file.write(s)
+            self._size += len(s.encode("utf-8", errors="backslashreplace"))
+            if self._size >= self._max_bytes:
+                self._rotate()
+        return len(s)
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._file.closed:  # close() 之後 IOBase 還會再呼叫一次 flush
+                self._file.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._file.close()
+        super().close()
 
 
 def _open_log_file():
@@ -71,7 +145,7 @@ def _open_log_file():
     for folder in (BASE_DIR, Path(tempfile.gettempdir())):
         path = folder / "whisper_app.log"
         try:
-            return path, open(path, "a", encoding="utf-8", buffering=1)
+            return path, _RotatingLog(path, LOG_MAX_BYTES, LOG_BACKUPS)
         except OSError:
             continue
     return None, open(os.devnull, "w", encoding="utf-8")
@@ -117,7 +191,6 @@ try:
     import importlib.util
     import shutil
     import subprocess
-    import threading
     import queue
     import re
     import json
@@ -162,6 +235,9 @@ MEDIA_EXTENSIONS = {
     ".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".aif",
 }
 MANY_FILES_CONFIRM = 30   # 一次要加入超過這麼多個檔案（例如不小心拖了整個資料夾）時，先問一下
+DEBUG_LOG = False         # True = faster_whisper 的詳細除錯訊息（每個語音片段、每次解碼）也寫進 log 檔；檔案會長得很快
+LOG_MAX_LINES = 3000      # 視窗右側「進度與日誌」最多留幾行，超過就從最舊的開始刪（完整內容還在 log 檔裡）
+SETTINGS_FILE = BASE_DIR / "whisper_settings.json"   # 記住視窗上的勾選狀態與 Hotwords
 
 # === Whisper 設定（固定使用 large-v3）===
 WHISPER_MODEL = "large-v3"
@@ -304,7 +380,7 @@ except Exception:
     raise
 
 logging.basicConfig()
-logging.getLogger("faster_whisper").setLevel(logging.DEBUG)
+logging.getLogger("faster_whisper").setLevel(logging.DEBUG if DEBUG_LOG else logging.INFO)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -1394,6 +1470,27 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     return output_path
 
 
+def load_settings(path: Path | None = None) -> dict:
+    """讀取上次記住的設定（勾選狀態、Hotwords）。檔案不存在、壞掉、格式不對都當作沒有設定，全部用預設值。"""
+    try:
+        data = json.loads((path or SETTINGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(data: dict, path: Path | None = None) -> bool:
+    """存設定。先寫暫存檔再換名，程式中途當掉也不會留下寫到一半的檔案。成功回傳 True。"""
+    path = path or SETTINGS_FILE
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 def _natural_key(path) -> list:
     """檔名裡的數字照大小排（第2話 排在 第10話 前面）。"""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(path))]
@@ -1594,6 +1691,9 @@ class App:
 
     def __init__(self, root):
         self.root = root
+        self._settings = load_settings()  # 上次記住的勾選狀態；沒有就全部用預設值
+        self._save_pending = False
+        self._save_failed = False
         root.title("Whisper 字幕產生器")
         root.configure(bg=Theme.WHITE)
         self._fit_window()
@@ -1618,6 +1718,9 @@ class App:
         self._build_settings(controls.body)
         self._build_hotwords(controls.body)
         self._build_log_panel(body)
+        for var in [self.use_sep_var, self.use_align_var, self.use_split_var, self.add_blank_var,
+                    *self.hotword_vars.values()]:
+            var.trace_add("write", self._on_setting_changed)  # 建好之後才掛，建立時的預設值不算「改動」
 
         # --- 背景處理：佇列 + 工作執行緒 ---
         self.file_queue = queue.Queue()
@@ -1654,10 +1757,10 @@ class App:
         inner = ttk.Frame(frame, style="Card.TFrame")
         inner.pack(fill="x", padx=10, pady=(2, 8))
 
-        self.use_sep_var = tk.BooleanVar(value=True)
-        self.use_align_var = tk.BooleanVar(value=True)
-        self.use_split_var = tk.BooleanVar(value=True)
-        self.add_blank_var = tk.BooleanVar(value=True)
+        self.use_sep_var = tk.BooleanVar(value=bool(self._settings.get("use_sep", True)))
+        self.use_align_var = tk.BooleanVar(value=bool(self._settings.get("use_align", True)))
+        self.use_split_var = tk.BooleanVar(value=bool(self._settings.get("use_split", True)))
+        self.add_blank_var = tk.BooleanVar(value=bool(self._settings.get("add_blank", True)))
         for var, text in [
             (self.use_sep_var, "先用 Demucs 分離人聲"),
             (self.use_align_var, "用 wav2vec2 強制對齊，校正時間戳"),
@@ -1698,8 +1801,11 @@ class App:
         ).pack(side="left", anchor="n", pady=(2, 0))
         grid = FlowGrid(row, style="Card.TFrame")
         grid.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        saved = self._settings.get("hotwords")
+        saved = saved if isinstance(saved, dict) else {}
         for word in words:
-            var = tk.BooleanVar(value=True)
+            # 第一次開啟：人名每部影片不同，預設不勾；通用詞預設勾。之後沿用上次的選擇
+            var = tk.BooleanVar(value=bool(saved.get(word, word in HOTWORD_COMMON_CANDIDATES)))
             self.hotword_vars[word] = var
             grid.add(ttk.Checkbutton(grid, text=word, variable=var, style="Card.TCheckbutton"))
 
@@ -1707,7 +1813,7 @@ class App:
     def _build_drop_zone(self, parent):
         self.drop_zone = tk.Frame(
             parent, bg=Theme.WHITE, height=self._px(110),
-            highlightthickness=3, highlightbackground=Theme.RED, highlightcolor=Theme.RED,
+            highlightthickness=self._px(3), highlightbackground=Theme.RED, highlightcolor=Theme.RED,
             cursor="hand2",
         )
         self.drop_zone.pack(side="bottom", fill="both", expand=True, pady=(10, 0))
@@ -1794,7 +1900,7 @@ class App:
 
         style.configure(
             "Card.TLabelframe", background=Theme.WHITE,
-            bordercolor=Theme.BLACK, borderwidth=2, relief="solid",
+            bordercolor=Theme.BLACK, borderwidth=self._px(2), relief="solid",
         )
         style.configure(
             "Card.TLabelframe.Label", background=Theme.WHITE,
@@ -1808,7 +1914,7 @@ class App:
         # 「人名 / 通用詞」小標籤：黑底白字的小徽章，呼應黑／紅／白三色
         style.configure(
             "Tag.TLabel", background=Theme.BLACK, foreground=Theme.WHITE,
-            font=(Theme.FONT_FAMILY, 9, "bold"), padding=(6, 2),
+            font=(Theme.FONT_FAMILY, 9, "bold"), padding=(self._px(6), self._px(2)),
         )
 
         style.configure(
@@ -1816,6 +1922,7 @@ class App:
         )
         style.configure(
             "Card.TCheckbutton", background=Theme.WHITE, foreground=Theme.BLACK, font=Theme.BODY_FONT,
+            indicatorsize=self._px(10),  # 勾選框的大小是像素，螢幕縮放大時要跟著放大，不然會比字小很多
         )
         style.map(
             "Card.TCheckbutton",
@@ -1828,7 +1935,7 @@ class App:
         style.configure(
             "Red.TButton", background=Theme.RED, foreground=Theme.WHITE,
             font=Theme.BUTTON_FONT, borderwidth=0, focusthickness=0,
-            padding=(14, 6),
+            padding=(self._px(14), self._px(6)),
         )
         style.map(
             "Red.TButton",
@@ -1839,8 +1946,8 @@ class App:
         # 次要按鈕：白底紅字紅框，跟主按鈕做出層級區分
         style.configure(
             "RedOutline.TButton", background=Theme.WHITE, foreground=Theme.RED,
-            font=Theme.BUTTON_FONT, borderwidth=1.5, bordercolor=Theme.RED,
-            padding=(14, 6),
+            font=Theme.BUTTON_FONT, borderwidth=self._px(1.5), bordercolor=Theme.RED,
+            padding=(self._px(14), self._px(6)),
         )
         style.map(
             "RedOutline.TButton",
@@ -1849,15 +1956,16 @@ class App:
         )
 
         # 小尺寸按鈕（放在外框標題列）：「Small.Red.TButton」會沿用 Red.TButton 的顏色，只改大小
-        style.configure("Small.Red.TButton", font=Theme.SMALL_BUTTON_FONT, padding=(10, 1))
-        style.configure("Small.RedOutline.TButton", font=Theme.SMALL_BUTTON_FONT, padding=(10, 1))
+        small_padding = (self._px(10), self._px(1))
+        style.configure("Small.Red.TButton", font=Theme.SMALL_BUTTON_FONT, padding=small_padding)
+        style.configure("Small.RedOutline.TButton", font=Theme.SMALL_BUTTON_FONT, padding=small_padding)
 
         # 進度條：紅色前景、淡灰底、黑色外框
         style.configure(
             "Red.Horizontal.TProgressbar",
             troughcolor=Theme.OFF_WHITE, background=Theme.RED,
             bordercolor=Theme.BLACK, lightcolor=Theme.RED, darkcolor=Theme.RED,
-            thickness=14,
+            thickness=self._px(14),
         )
 
     # ---- 頂部標題橫幅：紅底白字 + 黑色粗分隔線，營造 QuizKnock 節目片頭感 ----
@@ -1885,7 +1993,7 @@ class App:
             bg=Theme.RED, fg=Theme.WHITE, font=Theme.SUBTITLE_FONT, anchor="w",
         ).pack(fill="x")
 
-        tk.Frame(self.root, bg=Theme.BLACK, height=3).pack(fill="x")
+        tk.Frame(self.root, bg=Theme.BLACK, height=self._px(3)).pack(fill="x")
 
     # ---- 給背景執行緒呼叫，把更新丟回主執行緒（不可直接從子執行緒操作 Tk 元件）----
     def log(self, msg: str):
@@ -1898,14 +2006,12 @@ class App:
         self.ui_queue.put(("status", msg))
 
     def poll_ui_queue(self):
+        lines = []
         try:
             while True:
                 kind, payload = self.ui_queue.get_nowait()
                 if kind == "log":
-                    self.log_box.configure(state="normal")
-                    self.log_box.insert("end", str(payload) + "\n")
-                    self.log_box.see("end")
-                    self.log_box.configure(state="disabled")
+                    lines.append(str(payload))
                 elif kind == "progress":
                     self.progress["value"] = float(payload) * 100
                 elif kind == "status":
@@ -1913,12 +2019,48 @@ class App:
         except queue.Empty:
             pass
         finally:
+            if lines:
+                self._append_log(lines)  # 這一輪收到的日誌一次寫進去，比一行一行寫快
             # 就算處理某一筆時出錯，也要讓計時器繼續跑，不然畫面之後就不會更新了
             self.root.after(100, self.poll_ui_queue)
+
+    def _append_log(self, lines: list[str]) -> None:
+        """
+        把日誌寫進視窗。只有本來就捲在最底下時才跟著捲到最新；往上捲去看舊訊息時不會被拉回來。
+        超過 LOG_MAX_LINES 行就從最舊的開始刪（完整內容還在 log 檔裡）。
+        """
+        box = self.log_box
+        at_bottom = box.yview()[1] >= 0.999
+        box.configure(state="normal")
+        box.insert("end", "\n".join(lines) + "\n")
+        excess = int(box.index("end-1c").split(".")[0]) - 1 - LOG_MAX_LINES
+        if excess > 0:
+            box.delete("1.0", f"{excess + 1}.0")
+        box.configure(state="disabled")
+        if at_bottom:
+            box.see("end")
 
     def _set_all_hotwords(self, checked: bool):
         for var in self.hotword_vars.values():
             var.set(checked)
+
+    # ---- 記住設定：勾選一有變動就排一次存檔（連續改很多個只存一次）----
+    def _on_setting_changed(self, *_):
+        if not self._save_pending:
+            self._save_pending = True
+            self.root.after(500, self._save_settings)
+
+    def _save_settings(self):
+        self._save_pending = False
+        data = {
+            "version": 1,
+            "use_sep": self.use_sep_var.get(), "use_align": self.use_align_var.get(),
+            "use_split": self.use_split_var.get(), "add_blank": self.add_blank_var.get(),
+            "hotwords": {word: var.get() for word, var in self.hotword_vars.items()},
+        }
+        if not save_settings(data) and not self._save_failed:
+            self._save_failed = True  # 只提醒一次
+            self.log(f">>> 注意：無法儲存設定到 {SETTINGS_FILE}（下次開啟會回到預設值）")
 
     # ---- 拖放事件：把檔案丟進佇列，並給一次紅色閃爍當作「已接收」的視覺回饋 ----
     def on_drop(self, event):
@@ -2076,6 +2218,7 @@ class App:
                 "還有檔案在處理中（或排隊中），現在關閉會中止它們。\n\n確定要關閉嗎？",
                 parent=self.root):
             return
+        self._save_settings()
         JOBS.cancel()
         self.root.destroy()
 
@@ -2094,7 +2237,25 @@ class App:
             pass
 
 
+def _enable_dpi_awareness() -> None:
+    """
+    Windows：告訴系統這個程式自己會處理螢幕縮放。不宣告的話，螢幕縮放大於 100% 時
+    系統會把整個視窗當成圖片放大，字會糊掉，而且 _px() 量到的永遠是 96 DPI。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 系統層級的 DPI 感知（Python 的 IDLE 也是這樣做）
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()       # 舊版 Windows 沒有 shcore
+    except Exception:
+        pass
+
+
 def main():
+    _enable_dpi_awareness()  # 要在建立 Tk 視窗之前
     root = TkinterDnD.Tk()
     App(root)
     root.mainloop()
