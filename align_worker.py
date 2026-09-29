@@ -34,7 +34,14 @@
     注意 CTC 的特性：每個字只會在開始發音的那一兩個 frame 出現，所以一個詞的「終點」
     是最後一個字開始發音的位置，字拉長音的部分會算在跟下一個詞之間的空白裡。
 
-用法：python align_worker.py job.json result.json
+用法：
+    python align_worker.py --serve <閒置秒數>
+        常駐模式（w1_1.py 用這個）：工作一行一個從 stdin 讀進來
+        （JSON：{"job": job.json 路徑, "result": result.json 路徑}），開始做印 "START"，做完印 "END <0=成功>"。
+        模型載入一次就重複用；每個工作做完先把模型搬到 CPU 釋放顯存，讓 GPU 留給 Whisper／Demucs。
+        閒置超過指定秒數自己結束（釋放記憶體）；指定 0 表示做完一個工作就結束。
+    python align_worker.py job.json result.json
+        單次模式（手動測試用）：做完一個工作就結束。
     job.json    {"audio_npy", "segments": [{"start","end","text","words"(可省略)}, ...],
                  "model_name", "device", "sample_rate", "params": {...}}
                  words = 這句拆成詞的文字 list，接起來要等於 text；沒給就當整句是一個詞
@@ -42,11 +49,13 @@
                  "confs": [0～1 或 null, ...], "wide": [這句是否用第二輪結果, ...],
                  "word_spans": [[[詞起點, 詞終點] 或 null（詞裡沒有會發音的字）, ...] 或 null, ...]}
 stdout 每行一則訊息給主程式：
-    "LOG <文字>"、"PROGRESS <已完成> <總數>"、"ERROR <文字>"
+    "LOG <文字>"、"PROGRESS <已完成> <總數>"、"ERROR <文字>"、（常駐模式）"START"、"END <代碼>"
 """
 
 import json
+import queue
 import sys
+import threading
 import traceback
 import unicodedata
 
@@ -167,16 +176,66 @@ def ctc_align(log_probs: np.ndarray, tokens: list[int], blank_id: int):
 # =========================================================
 # === 主流程 ===
 # =========================================================
-def main():
-    job_path, result_path = sys.argv[1], sys.argv[2]
-    with open(job_path, encoding="utf-8") as f:
-        job = json.load(f)
+class Aligner:
+    """wav2vec2 模型。載入一次可以重複對很多個工作用（常駐模式）。"""
 
-    import torch
-    from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+    def __init__(self, model_name: str, device: str):
+        import torch
+        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
-    model_name = job["model_name"]
-    device = job["device"]
+        self.torch = torch
+        self.requested = (model_name, device)  # 之後的工作要求不同的模型或裝置時才需要重載
+        self.jobs_done = 0
+        if str(device) == "auto":
+            device = "cuda"
+        if str(device).startswith("cuda") and not torch.cuda.is_available():
+            emit("LOG", "偵測不到可用的 CUDA GPU（或 PyTorch 裝成 CPU 版），改用 CPU 對齊，速度會慢很多")
+            device = "cpu"
+        self.device = str(device)
+
+        emit("LOG", f"載入對齊模型：{model_name} …（第一次會下載，約 1.2 GB）")
+        self.processor = Wav2Vec2Processor.from_pretrained(model_name)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_name).to(device).eval()
+        tokenizer = self.processor.tokenizer
+        self.vocab = tokenizer.get_vocab()
+        self.blank_id = tokenizer.pad_token_id  # wav2vec2 CTC 的 blank 就是 <pad>
+        self.delim_id = self.vocab.get("|")
+        self.star_id = max(self.vocab.values()) + 1  # 萬用字元：接在字表最後面的額外一欄
+        # 萬用字元「任何發音都可以」是從這些欄裡取最高機率。只算真的會發音的字：
+        # 不含 blank、詞分隔符 |、以及 <s> </s> <unk> 這些特殊符號（它們不是發音，取到了會讓萬用字元亂貼）
+        excluded = {self.blank_id, self.delim_id, *getattr(tokenizer, "all_special_ids", [])}
+        candidates = [v for v in sorted(set(self.vocab.values())) if v not in excluded]
+        if not candidates:  # 字表很怪、全被排除時退回只排除 blank
+            candidates = [v for v in sorted(set(self.vocab.values())) if v != self.blank_id]
+        self.star_candidates = np.array(candidates)
+
+    def park(self) -> None:
+        """工作做完：把模型搬到 CPU、釋放顯存。常駐等下一個檔案的期間，GPU 留給 Whisper／Demucs。"""
+        if self.device.startswith("cuda"):
+            self.model.to("cpu")
+            self.torch.cuda.empty_cache()
+
+    def unpark(self) -> None:
+        """下一個工作開始：把模型搬回 GPU。"""
+        if self.device.startswith("cuda"):
+            self.model.to(self.device)
+
+    def log_probs(self, chunk: np.ndarray, sr: int):
+        """對一段音訊跑 wav2vec2，回傳 (log 機率含萬用字元欄, 每 frame 秒數)。"""
+        torch = self.torch
+        inputs = self.processor(chunk, sampling_rate=sr, return_tensors="pt")
+        with torch.inference_mode():
+            logits = self.model(inputs.input_values.to(self.device)).logits[0]
+        lp = torch.log_softmax(logits.float(), dim=-1).cpu().numpy()
+        if lp.shape[1] <= self.star_id:  # 模型輸出欄數跟字表不一致時補齊
+            lp = np.pad(lp, ((0, 0), (0, self.star_id - lp.shape[1])), constant_values=-np.inf)
+        star = lp[:, self.star_candidates[self.star_candidates < lp.shape[1]]].max(axis=1, keepdims=True) - STAR_PENALTY
+        lp = np.concatenate([lp[:, :self.star_id], star], axis=1)
+        return lp, (len(chunk) / sr) / lp.shape[0]
+
+
+def align_job(aligner: Aligner, job: dict) -> dict:
+    """用載入好的模型做一個對齊工作（兩輪對齊，說明見檔案開頭），回傳要寫進 result.json 的內容。"""
     sr = int(job["sample_rate"])
     segments = job["segments"]
     p = job["params"]
@@ -186,19 +245,7 @@ def main():
     batch_sec = float(p["batch_sec"])    # 第二輪：連續有問題的句子每批最長幾秒
     low_conf = float(p["low_conf"])
     max_inner_gap = float(p["max_inner_gap"])  # 同一句相鄰兩字最多空幾秒，超過視為被拉長
-
-    if str(device).startswith("cuda") and not torch.cuda.is_available():
-        emit("LOG", "偵測不到可用的 CUDA GPU（或 PyTorch 裝成 CPU 版），改用 CPU 對齊，速度會慢很多")
-        device = "cpu"
-
-    emit("LOG", f"載入對齊模型：{model_name} …（第一次會下載，約 1.2 GB）")
-    processor = Wav2Vec2Processor.from_pretrained(model_name)
-    model = Wav2Vec2ForCTC.from_pretrained(model_name).to(device).eval()
-    vocab = processor.tokenizer.get_vocab()
-    blank_id = processor.tokenizer.pad_token_id  # wav2vec2 CTC 的 blank 就是 <pad>
-    delim_id = vocab.get("|")
-    star_id = max(vocab.values()) + 1            # 萬用字元：接在字表最後面的額外一欄
-    non_blank = np.array([v for v in sorted(set(vocab.values())) if v != blank_id])
+    vocab, blank_id, delim_id, star_id = aligner.vocab, aligner.blank_id, aligner.delim_id, aligner.star_id
 
     audio = np.load(job["audio_npy"], mmap_mode="r")
     duration = len(audio) / sr
@@ -215,7 +262,10 @@ def main():
             toks.extend(wt)
         seg_tokens.append(toks)
         seg_word_ranges.append(ranges)
-    emit("LOG", f"對齊模型載入完成（字表 {len(vocab)} 個字元），開始對齊 {n} 條字幕")
+    if aligner.jobs_done == 0:
+        emit("LOG", f"對齊模型載入完成（字表 {len(vocab)} 個字元），開始對齊 {n} 條字幕")
+    else:
+        emit("LOG", f"沿用已載入的對齊模型，開始對齊 {n} 條字幕")
     if unknown_chars:
         shown = "".join(sorted(unknown_chars)[:40])
         more = f" 等 {len(unknown_chars)} 個" if len(unknown_chars) > 40 else ""
@@ -226,15 +276,7 @@ def main():
         chunk = np.asarray(audio[int(win_start * sr): int(win_end * sr)], dtype=np.float32)
         if len(chunk) < int(0.1 * sr):
             return None, 0.0
-        inputs = processor(chunk, sampling_rate=sr, return_tensors="pt")
-        with torch.inference_mode():
-            logits = model(inputs.input_values.to(device)).logits[0]
-        lp = torch.log_softmax(logits.float(), dim=-1).cpu().numpy()
-        if lp.shape[1] <= star_id:  # 模型輸出欄數跟字表不一致時補齊
-            lp = np.pad(lp, ((0, 0), (0, star_id - lp.shape[1])), constant_values=-np.inf)
-        star = lp[:, non_blank[non_blank < lp.shape[1]]].max(axis=1, keepdims=True) - STAR_PENALTY
-        lp = np.concatenate([lp[:, :star_id], star], axis=1)
-        return lp, (len(chunk) / sr) / lp.shape[0]
+        return aligner.log_probs(chunk, sr)
 
     def run_align(seg_ids, ws, we, extra_tokens=()):
         """
@@ -396,8 +438,76 @@ def main():
                            for a, b in seg_word_ranges[k]])
 
     emit("PROGRESS", "1000 1000")
+    aligner.jobs_done += 1
+    return {"spans": spans, "confs": confs, "wide": used_wide, "word_spans": word_spans}
+
+
+def run_once(job_path: str, result_path: str) -> None:
+    """單次模式：讀一個工作、做完、寫結果。"""
+    with open(job_path, encoding="utf-8") as f:
+        job = json.load(f)
+    result = align_job(Aligner(job["model_name"], job["device"]), job)
     with open(result_path, "w", encoding="utf-8") as f:
-        json.dump({"spans": spans, "confs": confs, "wide": used_wide, "word_spans": word_spans}, f)
+        json.dump(result, f)
+
+
+def serve(idle_sec: float) -> None:
+    """常駐模式：從 stdin 一行一個工作，模型只載入一次；idle_sec <= 0 表示做完一個就結束。"""
+    lines: queue.Queue = queue.Queue()
+
+    def read_stdin() -> None:
+        for line in sys.stdin:
+            lines.put(line)
+        lines.put(None)  # stdin 被關掉了：主程式不需要我了
+
+    threading.Thread(target=read_stdin, daemon=True).start()
+    aligner = None
+    while True:
+        try:
+            line = lines.get(timeout=idle_sec) if idle_sec > 0 else lines.get()
+        except queue.Empty:
+            emit("LOG", f"閒置超過 {idle_sec:g} 秒，對齊程序結束（下次要對齊會重新載入模型）")
+            return
+        if line is None:
+            return
+        if not line.strip():
+            continue
+        request = json.loads(line)
+        emit("START", "")
+        try:
+            with open(request["job"], encoding="utf-8") as f:
+                job = json.load(f)
+            key = (job["model_name"], job["device"])
+            if aligner is not None and aligner.requested == key:
+                aligner.unpark()
+            else:
+                aligner = None  # 先放掉舊的再載入新的
+                aligner = Aligner(*key)
+            result = align_job(aligner, job)
+            with open(request["result"], "w", encoding="utf-8") as f:
+                json.dump(result, f)
+            aligner.park()
+        except ImportError as e:
+            missing = getattr(e, "name", None) or "transformers"
+            emit("ERROR", f"缺少套件 {missing}（請執行 pip install {missing}）")
+            emit("END", 2)
+            sys.exit(2)
+        except Exception as e:
+            traceback.print_exc()
+            sys.stdout.flush()
+            emit("ERROR", f"{type(e).__name__}: {e}")
+            emit("END", 1)
+            sys.exit(1)  # 出錯之後模型狀態不可信（例如顯存不足），結束讓主程式下次重開
+        emit("END", 0)
+        if idle_sec <= 0:
+            return
+
+
+def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
+        serve(float(sys.argv[2]) if len(sys.argv) > 2 else 0.0)
+    else:
+        run_once(sys.argv[1], sys.argv[2])
 
 
 if __name__ == "__main__":

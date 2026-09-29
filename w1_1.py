@@ -44,6 +44,12 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        處理中直接關閉視窗會先詢問，確定關閉時一樣會把背景程序停掉。
        也可以把資料夾拖進來：會把裡面（含子資料夾）的影片／音訊依檔名加入佇列，
        不是影片／音訊的檔案會略過並在日誌說明。認得的副檔名在 MEDIA_EXTENSIONS。
+   13. 連續處理多個檔案時，對齊模型（wav2vec2）只載入一次：對齊程序會留著給下一個檔案用
+       （ALIGN_KEEP_ALIVE_SEC 秒沒用到就自己結束），每個檔案做完先把模型搬回 CPU，顯存留給 Whisper／Demucs。
+       Whisper／Demucs／對齊的裝置預設 "auto"：沒有 NVIDIA GPU 就自動改用 CPU（會慢很多）。
+       轉錄時會略過 Whisper 在靜音或背景音樂上編出來的固定片語（例如「ご視聴ありがとうございました」），
+       被略過的每一筆都寫在日誌，不需要時把 FILTER_HALLUCINATIONS 改成 False。
+       沒有勾「自動拆分」時，輸出檔名結尾會多一個 _nosplit，不會蓋掉有拆分的版本。
 """
 
 from __future__ import annotations   # 讓 int | None、list[str] 這類標註在 Python 3.9 也能載入
@@ -136,7 +142,8 @@ except Exception:
 # =========================================================
 # === 固定設定（不常變動，需要的話可直接改這裡）===
 # =========================================================
-SEPARATION_DEVICE = "cuda"        # 與 Whisper 共用 GPU，注意顯存是否足夠
+SEPARATION_DEVICE = "auto"        # "auto" = 有 NVIDIA GPU 就用，沒有就用 CPU（也可寫死 "cuda"／"cpu"）
+                                   # 用 GPU 時是與 Whisper 共用，注意顯存是否足夠
 SEPARATION_MODEL = "htdemucs"     # htdemucs_ft 是 4 個模型的組合，記憶體需求約 4 倍，容易爆記憶體
                                    # 若記憶體充足想換回更高品質版本，可改成 "htdemucs_ft"
 SEPARATION_SEGMENT = 7            # htdemucs 是 Transformer 架構，硬性上限 7.8 秒，不能設更大
@@ -158,8 +165,9 @@ MANY_FILES_CONFIRM = 30   # 一次要加入超過這麼多個檔案（例如不�
 
 # === Whisper 設定（固定使用 large-v3）===
 WHISPER_MODEL = "large-v3"
-WHISPER_DEVICE = "cuda"
-WHISPER_COMPUTE_TYPE = "float16"
+WHISPER_DEVICE = "auto"            # "auto" = 有 NVIDIA GPU 就用，沒有就改用 CPU（也可寫死 "cuda"／"cpu"）
+WHISPER_COMPUTE_TYPE = "float16"   # 用 GPU 時的計算精度
+WHISPER_CPU_COMPUTE_TYPE = "int8"  # 用 CPU 時的計算精度（CPU 不支援 float16）；large-v3 跑在 CPU 上會慢很多
 # 轉錄參數集中放這裡，要微調不用去翻 process_file
 TRANSCRIBE_OPTIONS = dict(
     language="ja",
@@ -177,7 +185,21 @@ TRANSCRIBE_OPTIONS = dict(
     compression_ratio_threshold=2.4,   # 同一句一直重複（壓縮率太高）就換溫度重跑
     log_prob_threshold=-1.5,
     no_speech_threshold=0.8,
+    # 只有在有詞時間時（勾了「自動拆分」）才會生效：偵測到可能是幻覺時，跳過超過這麼多秒的靜音再繼續。
+    # 不需要就設成 None
+    hallucination_silence_threshold=2.0,
 )
+# Whisper 在靜音或背景音樂上常常編出固定的片語（例如影片結尾的「ご視聴ありがとうございました」）。
+# 整條字幕「只有」下面這些片語之一，而且 Whisper 自己也覺得那裡不像有人說話（無語音機率高，或平均信心低）
+# 才會略過；真的有人說這句話時無語音機率會很低，不會被誤刪。被略過的每一筆都會寫在日誌。
+FILTER_HALLUCINATIONS = True
+HALLUCINATION_MIN_NO_SPEECH_PROB = 0.4   # 無語音機率達到這個值…
+HALLUCINATION_MAX_AVG_LOGPROB = -1.0     # …或平均 log 機率低於這個值，才當成幻覺
+HALLUCINATION_PHRASES = [
+    "ご視聴ありがとうございました", "ご視聴ありがとうございます", "最後までご視聴いただきありがとうございました",
+    "ご覧いただきありがとうございました", "チャンネル登録お願いします", "チャンネル登録をお願いします",
+    "チャンネル登録よろしくお願いします", "高評価お願いします",
+]
 # large-v3 的日文輸出常常完全沒有標點，會讓「依句尾標點拆分」派不上用場。
 # hotwords 會被放進每一個 30 秒視窗的提示裡，Whisper 會模仿提示的書寫風格，
 # 所以把 hotwords 用「、」串起來、最後加「。」，讓它比較願意輸出日文標點。
@@ -201,7 +223,8 @@ HOTWORD_COMMON_CANDIDATES = [
 # 這裡用日文 wav2vec2 聲學模型，把 Whisper 已經辨識出的文字「對」回音訊上，
 # 取第一個字與最後一個字實際發音的位置當作字幕起訖點（與 WhisperX 同樣的做法）。
 ALIGN_MODEL_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"
-ALIGN_DEVICE = "cuda"
+ALIGN_DEVICE = "auto"        # "auto" = 有 NVIDIA GPU 就用，沒有就用 CPU（也可寫死 "cuda"／"cpu"）
+ALIGN_KEEP_ALIVE_SEC = 120   # 對齊完後對齊程序留著等下一個檔案幾秒（省掉重新載入模型）；0 = 每個檔案都重新載入
 # 對齊分兩輪：第一輪每句只在 Whisper 時間附近找（穩）；只有第一輪看起來失敗的句子
 # 才在第二輪擴大範圍重找（範圍會被夾在前後對好的句子之間）。詳見 align_worker.py 開頭說明。
 ALIGN_PAD_SEC = 0.4          # 第一輪：Whisper 時間前後各多取幾秒
@@ -457,6 +480,7 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
     input_path = Path(input_path)
     report = progress_func or (lambda frac: None)
     source = input_path.stat()
+    requested_device, device = device, resolve_device(device)
     key = hashlib.sha1(f"{source.st_size}:{source.st_mtime_ns}".encode()).hexdigest()[:8]
     model_dir = Path(work_dir) / model_name
     final_dir = model_dir / f"{input_path.stem}__{key}"
@@ -481,6 +505,8 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
     if segment is not None:
         cmd += ["--segment", str(segment)]
 
+    if device == "cpu" and requested_device == "auto":
+        log_func("[人聲分離] 偵測不到可用的 NVIDIA GPU，改用 CPU 分離，會慢很多")
     log_func(f"[人聲分離] 開始處理：{input_path.name}（這步驟可能需要幾分鐘，視音訊長度與裝置而定）")
     print(f"[人聲分離] 指令：{' '.join(cmd)}")
     proc = None
@@ -507,6 +533,8 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
         JOBS.check()  # 被取消時子程序是被停掉的，回傳碼不是 0，要先判斷這個
         if returncode != 0:
             detail = "\n".join(tail) if tail else "（沒有輸出）"
+            if "not compiled with CUDA" in detail:
+                detail += "\n（Demucs 用的 PyTorch 是 CPU 版：把 SEPARATION_DEVICE 改成 \"cpu\"，或安裝 CUDA 版 PyTorch）"
             raise RuntimeError(f"Demucs 人聲分離失敗（代碼 {returncode}）：\n{detail}")
 
         produced = next(iter((tmp_out / model_name).glob("*/vocals.wav")), None)
@@ -528,14 +556,58 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
 _loaded_model = None
 
 
+_cuda_ok = None
+
+
+def cuda_available() -> bool:
+    """
+    這台電腦有沒有可用的 NVIDIA GPU。用 faster-whisper 內建的 ctranslate2 偵測，不必載入 torch；
+    偵測本身失敗就當作有（維持原本一律用 GPU 的行為）。
+    """
+    global _cuda_ok
+    if _cuda_ok is None:
+        try:
+            import ctranslate2
+            _cuda_ok = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            _cuda_ok = True
+    return _cuda_ok
+
+
+def resolve_device(setting: str) -> str:
+    """"auto" → 有 GPU 就 "cuda"，沒有就 "cpu"；其他值照原樣。"""
+    if setting == "auto":
+        return "cuda" if cuda_available() else "cpu"
+    return setting
+
+
 def get_model(log_func) -> WhisperModel:
     global _loaded_model
     if _loaded_model is None:
-        log_func(f"載入模型中：{WHISPER_MODEL} …（只有第一次會比較久）")
-        _loaded_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE,
-                                     compute_type=WHISPER_COMPUTE_TYPE)
+        device = resolve_device(WHISPER_DEVICE)
+        compute_type = WHISPER_COMPUTE_TYPE if device.startswith("cuda") else WHISPER_CPU_COMPUTE_TYPE
+        if device == "cpu" and WHISPER_DEVICE == "auto":
+            log_func(f"偵測不到可用的 NVIDIA GPU，Whisper 改用 CPU（{compute_type}），速度會慢很多")
+        log_func(f"載入模型中：{WHISPER_MODEL}（{device}／{compute_type}）…（只有第一次會比較久）")
+        _loaded_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
         log_func("模型載入完成。")
     return _loaded_model
+
+
+def _phrase_key(text: str) -> str:
+    """比對片語用：全形半形統一、去掉標點與空白。"""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).lower() if ch.isalnum())
+
+
+_HALLUCINATION_KEYS = frozenset(_phrase_key(p) for p in HALLUCINATION_PHRASES)
+
+
+def looks_like_hallucination(text: str, no_speech_prob, avg_logprob) -> bool:
+    """整條字幕只有已知的幻覺片語，而且 Whisper 自己也覺得那裡不像有人說話。"""
+    if not FILTER_HALLUCINATIONS or _phrase_key(text) not in _HALLUCINATION_KEYS:
+        return False
+    return ((no_speech_prob is not None and no_speech_prob >= HALLUCINATION_MIN_NO_SPEECH_PROB)
+            or (avg_logprob is not None and avg_logprob <= HALLUCINATION_MAX_AVG_LOGPROB))
 
 
 def build_hotwords(words: list[str]) -> str:
@@ -572,6 +644,86 @@ def _console_python() -> str:
         if candidate.exists():
             return str(candidate)
     return str(exe)
+
+
+class AlignServer:
+    """
+    對齊程序（align_worker.py --serve）的管理。載入 wav2vec2 要好幾秒，連續處理多個檔案時
+    程序留著給下一個檔案用；閒置超過 ALIGN_KEEP_ALIVE_SEC 秒它會自己結束並釋放記憶體。
+    取消、關閉視窗時 JOBS 會把它一起停掉，下次要用再重新啟動。
+    """
+
+    def __init__(self):
+        self._proc = None
+
+    def _ensure(self):
+        """回傳可用的對齊程序；還沒有或已經結束了就重新啟動。"""
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        JOBS.release(self._proc)  # 結束了的，從登記處拿掉
+        self._proc = JOBS.spawn(
+            [_console_python(), str(ALIGN_WORKER), "--serve", str(ALIGN_KEEP_ALIVE_SEC)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            env=_child_env(HF_HUB_DISABLE_SYMLINKS_WARNING="1"), creationflags=_NO_WINDOW,
+        )
+        return self._proc
+
+    def _drop(self, proc) -> None:
+        """丟掉一個確定不能用的對齊程序（等它真的結束），下次 _ensure 一定開新的。
+        剛結束的程序有一瞬間 poll() 還是 None，重試時不能再拿到它。"""
+        JOBS.release(proc)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        self._proc = None
+
+    def run(self, job_json: Path, result_json: Path, log_func, progress_func):
+        """交一個工作給對齊程序並等它做完。回傳 (代碼, 最後幾行輸出)；代碼 0 = 成功。"""
+        request = json.dumps({"job": str(job_json), "result": str(result_json)}, ensure_ascii=False) + "\n"
+        for attempt in (1, 2):
+            if self._proc is None or self._proc.poll() is not None:
+                log_func("[對齊] 啟動對齊程序…")
+            proc = self._ensure()
+            try:
+                proc.stdin.write(request)
+                proc.stdin.flush()
+            except OSError:  # 程序剛好在閒置逾時的瞬間結束了
+                self._drop(proc)
+                if attempt == 1:
+                    continue
+                raise
+            started, code = False, None
+            tail = collections.deque(maxlen=15)
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                if line.startswith("START"):
+                    started = True
+                elif line.startswith("END "):
+                    code = int(line.split()[1])
+                    break
+                elif line.startswith("PROGRESS "):
+                    done, total = line.split()[1:3]
+                    progress_func(int(done) / max(int(total), 1))
+                elif line.startswith("LOG "):
+                    log_func("[對齊] " + line[4:])
+                elif line.startswith("ERROR "):
+                    log_func("!!! [對齊] " + line[6:])
+                    tail.append(line[6:])
+                elif line.strip():
+                    print(line)  # transformers 的警告、下載進度等只寫進 log 檔
+                    tail.append(line)
+            JOBS.check()  # 被取消時對齊程序是被停掉的，輸出中斷，要先判斷這個
+            if code is None:  # 對齊程序在做完之前就沒了
+                if not started and attempt == 1:
+                    self._drop(proc)
+                    continue  # 還沒開始做就結束了（剛好閒置逾時）：重開一個再試一次
+                code = proc.wait() or 1
+            return code, tail
+
+
+ALIGN_SERVER = AlignServer()
 
 
 def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func) -> dict:
@@ -619,36 +771,12 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
             },
         }, ensure_ascii=False), encoding="utf-8")
 
-        env = _child_env(HF_HUB_DISABLE_SYMLINKS_WARNING="1")
-        log_func("[對齊] 啟動對齊程序…")
-        proc = JOBS.spawn(
-            [_console_python(), str(ALIGN_WORKER), str(job_json), str(result_json)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
-            creationflags=_NO_WINDOW,
-        )
-        try:
-            tail = collections.deque(maxlen=15)
-            for line in proc.stdout:
-                line = line.rstrip("\r\n")
-                if line.startswith("PROGRESS "):
-                    done, total = line.split()[1:3]
-                    progress_func(int(done) / max(int(total), 1))
-                elif line.startswith("LOG "):
-                    log_func("[對齊] " + line[4:])
-                elif line.startswith("ERROR "):
-                    log_func("!!! [對齊] " + line[6:])
-                    tail.append(line[6:])
-                elif line.strip():
-                    print(line)  # transformers 的警告、下載進度等只寫進 log 檔
-                    tail.append(line)
-            returncode = proc.wait()
-            JOBS.check()  # 被取消時子程序是被停掉的，回傳碼不是 0，要先判斷這個
-            if returncode != 0 or not result_json.exists():
-                detail = "\n".join(tail) if tail else "（沒有輸出）"
-                raise RuntimeError(f"對齊程序失敗（代碼 {returncode}）：\n{detail}")
-        finally:
-            JOBS.release(proc)
+        returncode, tail = ALIGN_SERVER.run(job_json, result_json, log_func, progress_func)
+        if returncode != 0 or not result_json.exists():
+            detail = "\n".join(tail) if tail else "（沒有輸出）"
+            if "--serve" in detail:  # 舊版 align_worker.py 不認得常駐模式
+                detail += "\n（align_worker.py 是舊版，請把它跟 w1_1.py 一起更新）"
+            raise RuntimeError(f"對齊程序失敗（代碼 {returncode}）：\n{detail}")
 
         result = json.loads(result_json.read_text(encoding="utf-8"))
 
@@ -1199,6 +1327,12 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     for segment in segments:
         JOBS.check()  # Whisper 是在這個迴圈裡一段一段轉錄的，取消最慢等到目前這一段做完
         text = segment.text.strip()
+        no_speech = getattr(segment, "no_speech_prob", None)
+        if looks_like_hallucination(text, no_speech, getattr(segment, "avg_logprob", None)):
+            shown = f"，無語音機率 {no_speech:.2f}" if no_speech is not None else ""
+            log_func(f"[幻覺過濾] 略過 [{format_timestamp(segment.start)}] {text}{shown}")
+            progress_func(min(segment.end / total, 1.0) * transcribe_weight)
+            continue
         words = ([Word(w.start, w.end, w.word) for w in segment.words]
                  if use_split and segment.words else None)
         raw.append({"start": segment.start, "end": segment.end, "text": text, "words": words})
@@ -1250,7 +1384,8 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
 
     align_tag = "_align" if align_result is not None else ""
     JOBS.check()
-    output_filename = f"{base}_{WHISPER_MODEL}_{sep_tag}{align_tag}.srt"
+    split_tag = "" if use_split else "_nosplit"  # 有沒有拆分的版本不會互相覆蓋
+    output_filename = f"{base}_{WHISPER_MODEL}_{sep_tag}{align_tag}{split_tag}.srt"
     output_path = os.path.join(output_dir, output_filename)
     write_srt(output_path, subs)
 
