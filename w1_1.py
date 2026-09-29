@@ -15,6 +15,11 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
          沒裝也能跑，會改用比較粗略的判斷規則）
     2. 平常用「字幕產生器.vbs」雙擊開啟即可（不會跳出黑色 cmd 視窗）。
        也可以直接執行 python w1_1.py 來測試。
+       .vbs 會自己找電腦上能用的 Python（3.9 以上）：先看 PATH，再看 py launcher 和登錄檔（沒勾
+       「Add to PATH」也找得到），Microsoft Store 的空殼捷徑排最後，而且每個都會先試跑過。
+       想指定某個 Python 或虛擬環境，改 .vbs 開頭的 PYTHONW_PATH。程式異常結束時 .vbs 會跳出訊息，
+       提示去看 whisper_app.log。同時只能開一個視窗（再開一次會提示已經開著；要允許多開，
+       把 whisper_app/config.py 的 ALLOW_MULTIPLE_INSTANCES 改成 True）。
     3. 視窗開啟後，先確認下方的設定（要不要先做人聲分離、對齊、拆分），
        再把影片或音訊檔案拖到拖放區，會自動開始轉錄。輸出的 .srt 會用
        原始檔名加上「_large-v3_是否分離」當後綴，不會互相覆蓋，也不用每次
@@ -98,10 +103,14 @@ except Exception:
 
 runtime.setup_logging()  # 最先做：之後任何錯誤、print 都會進 log 檔
 
+if not runtime.acquire_single_instance():  # 已經有另一個視窗在執行：不要再開一個
+    runtime.show_notice("Whisper 字幕產生器已經開著了（請看工作列）。\n同時只能開一個視窗。")
+    sys.exit(0)
+
 try:
     from whisper_app import gui  # 這一步才會載入 tkinterdnd2、faster_whisper 等
 except Exception:
-    runtime.show_fatal_error("缺少必要套件或載入失敗（例如 tkinterdnd2 / faster_whisper 沒裝好）。")
+    runtime.show_fatal_error("缺少必要套件或載入失敗（例如 tkinterdnd2 / faster_whisper 沒裝好）。\n\n" + runtime.python_hint())
     raise
 
 runtime.setup_dirs()  # 建立輸出資料夾；失敗時會自己跳訊息框並丟出例外

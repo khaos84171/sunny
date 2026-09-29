@@ -1,6 +1,7 @@
 """啟動流程：log 檔輪替、log 導向、輸出資料夾與備用位置、啟動失敗的訊息框。"""
 import builtins
 import logging
+import os
 import sys
 import tempfile
 import threading
@@ -233,3 +234,110 @@ def test_dialog_can_be_switched_off_for_automation(monkeypatch):
     monkeypatch.setenv("WHISPER_APP_NO_DIALOG", "1")
     monkeypatch.setitem(sys.modules, "tkinter", types.SimpleNamespace())    # 如果真的去用會爆
     runtime.show_fatal_error("不該跳出來")
+
+
+# ---------------- 同時只開一個視窗 ----------------
+@pytest.fixture
+def lock_env(tmp_path, monkeypatch):
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(config, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    monkeypatch.setattr(runtime, "_instance_lock", None)
+    yield tmp_path
+    if runtime._instance_lock is not None:
+        runtime._instance_lock.close()
+
+
+def release(monkeypatch):
+    runtime._instance_lock.close()
+    monkeypatch.setattr(runtime, "_instance_lock", None)
+
+
+def test_only_one_instance_at_a_time_and_lock_can_be_taken_again_after_release(lock_env, monkeypatch):
+    assert runtime.acquire_single_instance() is True
+    assert runtime.acquire_single_instance() is False                      # 第二個被擋下
+    release(monkeypatch)
+    assert runtime.acquire_single_instance() is True                       # 放掉之後又可以了
+
+
+def test_multiple_instances_allowed_when_configured(lock_env, monkeypatch):
+    monkeypatch.setattr(config, "ALLOW_MULTIPLE_INSTANCES", True)
+    assert runtime.acquire_single_instance() is True and runtime.acquire_single_instance() is True
+    assert not (lock_env / "whisper_app.lock").exists()
+
+
+def test_separate_installations_do_not_block_each_other(lock_env, monkeypatch, tmp_path):
+    assert runtime.acquire_single_instance() is True
+    other = tmp_path / "另一份"
+    other.mkdir()
+    monkeypatch.setattr(config, "BASE_DIR", other)
+    assert runtime.acquire_single_instance() is True
+
+
+def test_falls_back_to_a_lock_in_the_temp_folder_and_still_excludes(lock_env, monkeypatch):
+    (lock_env / "whisper_app.lock").mkdir()                                # 同名資料夾擋住，程式資料夾裡建不起鎖檔
+    assert runtime.acquire_single_instance() is True
+    assert runtime.acquire_single_instance() is False
+    assert list((lock_env / "tmp").glob("whisper_app_*.lock"))
+
+
+def test_never_blocks_the_user_when_no_lock_file_can_be_created(lock_env):
+    (lock_env / "whisper_app.lock").mkdir()
+    import hashlib
+    tag = hashlib.sha1(str(lock_env).encode("utf-8")).hexdigest()[:8]
+    (lock_env / "tmp" / f"whisper_app_{tag}.lock").mkdir()
+    assert runtime.acquire_single_instance() is True and runtime.acquire_single_instance() is True
+
+
+@pytest.mark.parametrize("already_locked, expected", [(False, True), (True, False)])
+def test_windows_uses_msvcrt_locking(lock_env, monkeypatch, already_locked, expected):
+    calls = []
+
+    def locking(fd, mode, nbytes):
+        calls.append((mode, nbytes))
+        if already_locked:
+            raise PermissionError("Permission denied")
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(LK_NBLCK=2, locking=locking))
+    fake_os = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("__")})
+    fake_os.name = "nt"
+    monkeypatch.setattr(runtime, "os", fake_os)
+    assert runtime.acquire_single_instance() is expected
+    assert calls == [(2, 1)]                                               # LK_NBLCK（不等待）、鎖 1 個位元組
+
+
+# ---------------- 一般提示 / Python 提示 ----------------
+def test_notice_is_logged_and_shown_as_an_information_box(monkeypatch, capsys):
+    monkeypatch.delenv("WHISPER_APP_NO_DIALOG", raising=False)
+    shown = []
+    fake_tk = types.SimpleNamespace(Tk=lambda: types.SimpleNamespace(withdraw=lambda: None, destroy=lambda: None))
+    fake_box = types.SimpleNamespace(showinfo=lambda title, text: shown.append(("info", text)),
+                                     showerror=lambda title, text: shown.append(("error", text)))
+    monkeypatch.setitem(sys.modules, "tkinter", types.SimpleNamespace(Tk=fake_tk.Tk, messagebox=fake_box))
+    monkeypatch.setitem(sys.modules, "tkinter.messagebox", fake_box)
+    runtime.show_notice("已經開著了")
+    assert shown == [("info", "已經開著了")] and "已經開著了" in capsys.readouterr().out
+
+
+def test_notice_falls_back_to_windows_information_box(monkeypatch):
+    monkeypatch.delenv("WHISPER_APP_NO_DIALOG", raising=False)
+    monkeypatch.setitem(sys.modules, "tkinter", None)
+    shown = []
+    monkeypatch.setitem(sys.modules, "ctypes", types.SimpleNamespace(windll=types.SimpleNamespace(
+        user32=types.SimpleNamespace(MessageBoxW=lambda hwnd, text, title, flags: shown.append((text, flags))))))
+    runtime.show_notice("已經開著了")
+    assert shown == [("已經開著了", 0x40)]                                    # 0x40 = 資訊圖示（錯誤是 0x10）
+
+
+def test_fatal_error_message_is_also_written_to_the_log(monkeypatch, capsys):
+    monkeypatch.setenv("WHISPER_APP_NO_DIALOG", "1")
+    runtime.show_fatal_error("缺少必要套件")
+    assert "缺少必要套件" in capsys.readouterr().out
+
+
+def test_python_hint_points_at_the_console_python_next_to_pythonw(tmp_path, monkeypatch):
+    (tmp_path / "python.exe").write_text("")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "pythonw.exe"))
+    hint = runtime.python_hint()
+    assert str(tmp_path / "pythonw.exe") in hint and f'"{tmp_path / "python.exe"}" -m pip install' in hint and "tkinterdnd2" in hint
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "elsewhere" / "pythonw.exe"))
+    assert "elsewhere" in runtime.python_hint().split("-m pip")[0]        # 旁邊沒有 python.exe 就照原樣

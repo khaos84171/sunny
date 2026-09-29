@@ -13,6 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent   # 放 w1_1.py 的那個資�
 # log 檔超過這個大小就換檔（whisper_app.log → .log.1 → .log.2 …），只留最近幾份，不會無限長大
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUPS = 3
+ALLOW_MULTIPLE_INSTANCES = False   # False = 同時只能開一個視窗（兩個會同時寫同一個 log 與設定檔、各載入一份模型搶顯存）
 SEPARATION_DEVICE = "auto"        # "auto" = 有 NVIDIA GPU 就用，沒有就用 CPU（也可寫死 "cuda"／"cpu"）
                                    # 用 GPU 時是與 Whisper 共用，注意顯存是否足夠
 SEPARATION_MODEL = "htdemucs"     # htdemucs_ft 是 4 個模型的組合，記憶體需求約 4 倍，容易爆記憶體

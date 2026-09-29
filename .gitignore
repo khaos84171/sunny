@@ -6,3 +6,5 @@ whisper_app.log*
 whisper_settings.json
 whisper_settings.json.tmp
 whisper_startup_error.txt
+whisper_app.lock
+whisper_app_*.lock

@@ -31,7 +31,8 @@ python -m pytest tests
 | `test_aligner.py` | 主程式這一側的對齊程序管理（重用、逾時、取消、出錯、重試） |
 | `test_runtime.py` | log 輪替、輸出資料夾與備用位置、啟動失敗的訊息框 |
 | `test_gui.py` | 設定記憶、Hotwords 預設、日誌視窗、取消／佇列／拖放、錯誤回報、關閉視窗、DPI |
-| `test_startup.py` | 入口 `w1_1.py` 的啟動保護（缺套件資料夾、缺必要套件、正常載入） |
+| `test_startup.py` | 入口 `w1_1.py` 的啟動保護（缺套件資料夾、缺必要套件、正常載入、重複開啟會安靜地結束） |
+| `test_vbs.py`（`vbs_lint.py`） | `字幕產生器.vbs` 的靜態檢查：純 ASCII／CRLF、區塊配對、`Option Explicit` 下的變數宣告，以及它試跑 Python 用的結束碼約定。Linux 上沒辦法真的執行 .vbs，所以只能檢查到這裡 |
 
 ## 黃金檔 `golden/`
 

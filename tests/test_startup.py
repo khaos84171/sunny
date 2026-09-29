@@ -56,3 +56,20 @@ def test_normal_start_sets_up_logging_and_folders_without_opening_a_window(app_c
     assert "loaded True whisper_app.log" in result.stdout
     assert "寫進 log 的一行" in (app_copy / "whisper_app.log").read_text(encoding="utf-8")
     assert (tmp_path / "out" / "text").is_dir() and (tmp_path / "out" / "separated").is_dir()
+
+
+def test_second_copy_exits_quietly_while_the_first_holds_the_lock(app_copy):
+    holder_code = ("import sys, time\nsys.path.insert(0, %r)\nfrom whisper_app import runtime\n"
+                   "assert runtime.acquire_single_instance()\nprint('locked', flush=True)\ntime.sleep(60)\n" % str(app_copy))
+    holder = subprocess.Popen([sys.executable, "-c", holder_code], cwd=app_copy, stdout=subprocess.PIPE, text=True,
+                              env=dict(os.environ, PYTHONPATH="", WHISPER_APP_NO_DIALOG="1"))
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        result = run_entry(app_copy, timeout=30)
+        assert result.returncode == 0                                        # 安靜地結束，不是錯誤
+        assert "已經開著了" in (app_copy / "whisper_app.log").read_text(encoding="utf-8")
+    finally:
+        holder.kill()
+        holder.wait()
+    code = "import sys\nfrom whisper_app import runtime\nprint(runtime.acquire_single_instance(), file=sys.__stdout__)\n"
+    assert run_entry(app_copy, code).stdout.strip() == "True"               # 第一個結束後，鎖自動放掉

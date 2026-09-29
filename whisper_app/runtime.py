@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -115,27 +116,78 @@ def setup_logging() -> None:
     logging.getLogger("faster_whisper").setLevel(logging.DEBUG if config.DEBUG_LOG else logging.INFO)
 
 
-def show_fatal_error(message: str):
-    """啟動失敗或執行中發生未捕捉例外時，跳出訊息框告知使用者。"""
-    traceback.print_exc()
-    if os.environ.get("WHISPER_APP_NO_DIALOG"):  # 自動測試用：只記錄，不要跳出會卡住的訊息框
+def _show_message(kind: str, title: str, text: str) -> None:
+    """跳出訊息框（kind = "error" 或 "info"）。tkinter 不能用（例如安裝 Python 時沒勾 tcl/tk）就改用 Windows 內建的；都不行就算了。"""
+    if os.environ.get("WHISPER_APP_NO_DIALOG"):  # 自動測試用：不要跳出會卡住的訊息框
         return
-    title = "Whisper 字幕產生器 - 發生錯誤"
-    text = message + (f"\n\n詳細錯誤已寫入：\n{LOG_FILE}" if LOG_FILE else "")
     try:
         import tkinter as _tk
         from tkinter import messagebox as _mb
         _root = _tk.Tk()
         _root.withdraw()
-        _mb.showerror(title, text)
+        (_mb.showerror if kind == "error" else _mb.showinfo)(title, text)
         _root.destroy()
     except Exception:
-        # tkinter 本身載入失敗（例如安裝 Python 時沒有勾 tcl/tk）：改用 Windows 內建的訊息框
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
+            ctypes.windll.user32.MessageBoxW(0, text, title, 0x10 if kind == "error" else 0x40)
         except Exception:
             pass
+
+
+def show_fatal_error(message: str):
+    """啟動失敗或執行中發生未捕捉例外時，跳出訊息框告知使用者。"""
+    traceback.print_exc()
+    print(message)  # 訊息本身也留在 log 裡，事後才知道當時告訴使用者什麼
+    text = message + (f"\n\n詳細錯誤已寫入：\n{LOG_FILE}" if LOG_FILE else "")
+    _show_message("error", "Whisper 字幕產生器 - 發生錯誤", text)
+
+
+def show_notice(message: str) -> None:
+    """一般提示（不是錯誤）：記進 log，並跳出訊息框。"""
+    print(message)
+    _show_message("info", "Whisper 字幕產生器", message)
+
+
+def python_hint() -> str:
+    """缺套件時要告訴使用者：現在用的是哪一個 Python，該用哪個 Python 去裝（電腦上有好幾個 Python 時很重要）。"""
+    exe = Path(sys.executable)
+    console = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").exists() else exe
+    return (f"目前用的 Python：{exe}\n\n缺套件的話，請在命令列用「同一個 Python」安裝：\n"
+            f"\"{console}\" -m pip install tkinterdnd2 faster-whisper transformers janome")
+
+
+_instance_lock = None  # 程式活著的期間一直拿著這個檔案，鎖才不會被放掉
+
+
+def acquire_single_instance() -> bool:
+    """
+    同時只讓一個視窗執行。用檔案鎖：程式結束（或當掉）時系統會自動放掉，不會留下過期的鎖。
+    回傳 True = 可以繼續；False = 已經有另一個視窗在執行。鎖檔建不起來（例如唯讀資料夾）時不擋人，回傳 True。
+    """
+    global _instance_lock
+    if config.ALLOW_MULTIPLE_INSTANCES:
+        return True
+    tag = hashlib.sha1(str(config.BASE_DIR).encode("utf-8", errors="replace")).hexdigest()[:8]
+    for path in (config.BASE_DIR / "whisper_app.lock", Path(tempfile.gettempdir()) / f"whisper_app_{tag}.lock"):
+        try:
+            handle = open(path, "a+")
+        except OSError:
+            continue
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:  # 別的程序已經鎖住了
+            handle.close()
+            return False
+        _instance_lock = handle
+        return True
+    return True
 
 
 def _ensure_dir(preferred: str, name: str, label: str) -> str:
