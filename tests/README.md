@@ -21,7 +21,7 @@ python -m pytest tests
 |---|---|
 | `test_srt_io.py` | SRT 時間格式、各種編碼、多行字幕、開頭空白字幕 |
 | `test_splitter.py` | 字幕拆分：句尾標點、停頓、長度上限、右括號、不切在詞中間（有／沒有 janome） |
-| `test_timing.py` | 對齊後的時間微調（不推遲下一條）、套用對齊結果、檢查報告 |
+| `test_timing.py` | 對齊後的時間微調（不推遲下一條）、套用對齊結果、檢查報告、字幕時間軸整個差整數小時的偵測（剪輯軟體匯出的字幕） |
 | `test_dropped.py`, `test_settings_store.py` | 拖進來的東西整理、設定檔讀寫 |
 | `test_jobs.py` | 取消與子程序管理 |
 | `test_separation.py` | Demucs：呼叫方式、進度、快取（含殘檔）、取消、找 Demucs 的順序（用 `fakes/demucs`） |

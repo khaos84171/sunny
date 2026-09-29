@@ -25,12 +25,12 @@ class FakeModel:
         return iter(self.segments), types.SimpleNamespace(duration=100.0, duration_after_vad=90.0)
 
 
-def fake_align(audio, segments, log, progress):
+def fake_align(audio, segments, log, progress, detect_offset=False):
     progress(0.5)
     progress(1.0)
     n = len(segments)
-    return {"duration": 100.0, "spans": [[s["start"], s["end"]] for s in segments], "confs": [0.9] * n, "wide": [False] * n,
-            "word_spans": [None] * n}
+    return {"duration": 100.0, "offset": 0.0, "spans": [[s["start"], s["end"]] for s in segments], "confs": [0.9] * n,
+            "wide": [False] * n, "word_spans": [None] * n}
 
 
 @pytest.fixture
@@ -145,6 +145,25 @@ def test_align_only_progress_and_output_name(monkeypatch, tmp_path):
         assert prog == sorted(prog)
     monkeypatch.setattr(config, "ALIGN_REFINE", False)
     assert Path(pipeline.align_existing_srt(str(srt), "/x/影片.mp4", False, lambda m: None, lambda p: None)).name == "a_align_ctc.srt"
+
+
+def test_align_only_asks_for_offset_detection_and_keeps_the_srt_timeline(monkeypatch, tmp_path):
+    """剪輯軟體匯出的字幕從 01:00:00 開始：對齊完仍然是那條時間軸，空白字幕也從 01:00:00 開始。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n01:00:02,000 --> 01:00:04,000\nこんにちは\n\n2\n01:00:06,000 --> 01:00:08,000\nさようなら\n", encoding="utf-8")
+    seen = {}
+
+    def align_with_offset(audio, segments, log, progress, detect_offset=False):
+        seen["detect_offset"] = detect_offset
+        n = len(segments)
+        return {"duration": 100.0 + 3600.0, "offset": 3600.0, "spans": [[s["start"] + 0.1, s["end"] - 0.1] for s in segments],
+                "confs": [0.9] * n, "wide": [False] * n, "word_spans": [None] * n}
+    monkeypatch.setattr(pipeline, "run_alignment", align_with_offset)
+    out = pipeline.align_existing_srt(str(srt), "/x/影片.mp4", False, lambda m: None, lambda p: None, add_blank=True)
+    text = Path(out).read_text(encoding="utf-8")
+    assert seen["detect_offset"] is True
+    assert text.startswith("1\n01:00:00,000 --> 01:00:02,100\n\u200b\n\n2\n01:00:02,100 --> ")
+    assert "01:00:06,100" in text and text.count("-->") == 3
 
 
 def test_align_only_rejects_srt_without_subtitles(tmp_path):

@@ -21,8 +21,12 @@ from whisper_app.timing import apply_alignment, finalize_aligned_timing
 KANA = "あいうえおかきくけこさしすせそたちつてとなにぬねの"
 
 
-def build_case(tmp_path, n=14, seed=3, ghost=False):
-    """回傳 (標準答案 SRT, 粗略時間的輸入 SRT, 音訊)。ghost=True 時再加一條音訊裡沒有聲音、CTC 卻硬對上的字幕。"""
+def build_case(tmp_path, n=14, seed=3, ghost=False, offset=0.0):
+    """
+    寫出 ref.srt（標準答案）、rough.srt（粗略時間的輸入）、script.json、audio.npy，回傳音訊。
+    ghost=True 時再加一條音訊裡沒有聲音、CTC 卻硬對上的字幕。
+    offset：兩份 SRT 的時間整個加上這麼多秒（模擬剪輯軟體匯出、時間軸從 01:00:00 開始的字幕；音訊不變）。
+    """
     rng = random.Random(seed)
     speech, spikes, ref, rough = [], [], [], []
     t = 1.0
@@ -56,8 +60,9 @@ def build_case(tmp_path, n=14, seed=3, ghost=False):
     np.save(tmp_path / "audio.npy", audio)
     (tmp_path / "script.json").write_text(json.dumps({"audio": str(tmp_path / "audio.npy"), "spikes": spikes}, ensure_ascii=False),
                                           encoding="utf-8")
-    write_srt(str(tmp_path / "ref.srt"), ref)
-    write_srt(str(tmp_path / "rough.srt"), rough)
+    shift = lambda lines: [{**l, "start": l["start"] + offset, "end": l["end"] + offset} for l in lines]
+    write_srt(str(tmp_path / "ref.srt"), shift(ref))
+    write_srt(str(tmp_path / "rough.srt"), shift(rough))
     return audio
 
 
@@ -107,6 +112,35 @@ def test_sound_refinement_cuts_the_alignment_error_end_to_end(tmp_path, run_pipe
     # 評估工具的交叉驗證也看得出來：CTC 版有固定的偏差可以修，微調版沒有
     assert ctc["cv_start"]["after"]["mean_abs"] < ctc["cv_start"]["before"]["mean_abs"] / 2
     assert refined["cv_start"]["before"]["mean_abs"] - refined["cv_start"]["after"]["mean_abs"] < 0.005
+
+
+def test_subtitles_from_an_editor_timeline_starting_at_one_hour_are_aligned_and_stay_on_that_timeline(tmp_path, run_pipeline, monkeypatch):
+    """剪輯軟體（DaVinci Resolve 等）匯出的字幕從 01:00:00 開始：整份差一小時，以前每一條都「對不上」。
+    現在要自動偵測、扣掉再對齊，輸出仍然是那條時間軸，而且準確度跟沒有偏移時一樣。"""
+    build_case(tmp_path, offset=3600.0)
+    out, logs = run_pipeline()
+    assert any("從 01:00:00,000 開始" in x for x in logs) and not any("對不上" in x for x in logs)
+    assert not any("建議檢查" in x for x in logs)
+    r = evaluate.evaluate(tmp_path / "ref.srt", out)
+    assert r["matched"] == 14 and r["start"]["mean_abs"] < 0.02 and r["end"]["mean_abs"] < 0.02
+    assert r["start"]["within"][0.04] >= 0.95
+    first = evaluate.load_subtitles(out)[0]
+    assert 3600 < first["start"] < 3610                                      # 仍然是 01:00:0x，不是被平移成 00:00:0x
+
+
+def test_editor_timeline_with_leading_blank_starts_the_blank_at_the_timeline_origin(tmp_path, run_pipeline, monkeypatch):
+    build_case(tmp_path, offset=3600.0)
+    monkeypatch.setattr(aligner, "decode_audio", lambda path, sampling_rate=16000: np.load(tmp_path / "audio.npy"))
+    logs = []
+    out = pipeline.align_existing_srt(str(tmp_path / "rough.srt"), "/x/影片.mp4", False, logs.append, lambda p: None, add_blank=True)
+    head = open(out, encoding="utf-8").read().split("\n\n")[0]
+    assert head.startswith("1\n01:00:00,000 --> 01:00:0") and head.endswith("\u200b")
+
+
+def test_subtitles_that_do_not_belong_to_the_video_are_rejected_with_an_explanation(tmp_path, run_pipeline):
+    build_case(tmp_path, offset=5000.5)                                      # 差的不是整數小時：沒辦法自動處理
+    with pytest.raises(ValueError, match="對不起來"):
+        run_pipeline()
 
 
 def test_a_line_with_no_sound_behind_it_is_reported(tmp_path, run_pipeline):

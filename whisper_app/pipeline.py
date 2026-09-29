@@ -50,14 +50,15 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
         audio_input = str(media_path)
     JOBS.check()
 
-    result = run_alignment(audio_input, segments, log_func, progress_func)
+    # detect_offset：剪輯軟體匯出的字幕常從 01:00:00 開始，整個差一小時；偵測到就先扣掉再對齊，輸出維持原本的時間軸
+    result = run_alignment(audio_input, segments, log_func, progress_func, detect_offset=True)
     apply_alignment(segments, result, log_func)
     # 輸出用另一份，檢查報告才看得到後處理（提早出現、防重疊）之前的對齊時間
     subs = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],
              "src": i, "aligned": seg["aligned"]} for i, seg in enumerate(segments)]
     finalize_aligned_timing(subs, result["duration"])
     if add_blank:
-        add_leading_blank(subs, log_func)
+        add_leading_blank(subs, log_func, origin=result["offset"])
     report_alignment(segments, subs, log_func)
 
     JOBS.check()

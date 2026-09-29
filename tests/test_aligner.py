@@ -144,6 +144,64 @@ def capture_job(monkeypatch, checks=None):
     return sent
 
 
+def echo_worker(monkeypatch):
+    """不啟動真的 worker：記下送出去的 job.json，結果是「每句縮進 0.1 秒」（詞的時間有一個 None），用來看時間軸有沒有換算對。"""
+    sent = []
+
+    def run(job_json, result_json, log, progress):
+        job = json.loads(job_json.read_text(encoding="utf-8"))
+        sent.append(job)
+        segs = job["segments"]
+        result = {"spans": [[s["start"] + 0.1, s["end"] - 0.1] for s in segs], "confs": [0.9] * len(segs), "wide": [False] * len(segs),
+                  "word_spans": [[[s["start"] + 0.1, s["start"] + 0.5], None] for s in segs]}
+        result_json.write_text(json.dumps(result), encoding="utf-8")
+        return 0, []
+    monkeypatch.setattr(aligner.ALIGN_SERVER, "run", run)
+    monkeypatch.setattr(aligner, "decode_audio", lambda path, sampling_rate=16000: AUDIO)   # 40 秒
+    return sent
+
+
+def at(offset):
+    return [{"start": offset + 1.0 + 3 * i, "end": offset + 3.0 + 3 * i, "text": t, "words": None}
+            for i, t in enumerate(["今日は天気がいい", "熊本地震", "あいうえおかきく"])]
+
+
+def test_timeline_offset_of_a_whole_hour_is_removed_before_aligning_and_added_back(monkeypatch):
+    sent = echo_worker(monkeypatch)
+    logs = []
+    result = aligner.run_alignment("/x/a.wav", at(3600.0), logs.append, lambda p: None, detect_offset=True)
+    assert [(s["start"], s["end"]) for s in sent[0]["segments"]] == [(1.0, 3.0), (4.0, 6.0), (7.0, 9.0)]      # worker 看到影片的時間軸
+    assert result["offset"] == 3600.0 and result["duration"] == 3640.0
+    assert result["spans"] == [[3601.1, 3602.9], [3604.1, 3605.9], [3607.1, 3608.9]]                            # 回來的是字幕原本的時間軸
+    assert result["word_spans"][0] == [[3601.1, 3601.5], None]                                                    # None 維持 None
+    assert any("01:00:00,000" in x and "提早 1 小時" in x for x in logs)
+
+
+def test_no_offset_detection_by_default(monkeypatch):
+    sent = echo_worker(monkeypatch)
+    result = aligner.run_alignment("/x/a.wav", at(0.0), lambda m: None, lambda p: None)
+    assert sent[0]["segments"][0]["start"] == 1.0 and result["offset"] == 0.0 and result["duration"] == 40.0
+    sent = echo_worker(monkeypatch)                                                  # 轉錄流程的字幕時間本來就對，不做偵測
+    aligner.run_alignment("/x/a.wav", at(3600.0), lambda m: None, lambda p: None)
+    assert sent[0]["segments"][0]["start"] == 3601.0
+
+
+def test_hopeless_timeline_raises_before_starting_the_worker(monkeypatch):
+    sent = echo_worker(monkeypatch)
+    with pytest.raises(ValueError, match="對不起來"):
+        aligner.run_alignment("/x/a.wav", at(5000.5), lambda m: None, lambda p: None, detect_offset=True)
+    assert sent == []
+
+
+def test_lines_past_the_end_of_the_media_are_mentioned(monkeypatch):
+    echo_worker(monkeypatch)
+    lines = [{"start": 1.0 + i, "end": 1.5 + i, "text": "はい", "words": None} for i in range(20)]
+    lines.append({"start": 100.0, "end": 101.0, "text": "遅い", "words": None})
+    logs = []
+    result = aligner.run_alignment("/x/a.wav", lines, logs.append, lambda p: None, detect_offset=True)
+    assert result["offset"] == 0.0 and any("有 1 條字幕的起點超過影片長度" in x for x in logs)
+
+
 def test_refine_settings_are_sent_to_the_worker(monkeypatch):
     sent = capture_job(monkeypatch)
     monkeypatch.setattr(config, "ALIGN_REFINE_BACK_SEC", 0.2)

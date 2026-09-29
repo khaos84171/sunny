@@ -58,6 +58,17 @@ def test_add_leading_blank_inserts_until_first_subtitle():
     assert "00:00:02,000" in logs[0]
 
 
+def test_add_leading_blank_starts_at_the_timeline_origin():
+    """時間軸從 01:00:00 開始的字幕：空白字幕從那裡開始，不是從 0（不然是一條長一小時的空白字幕）。"""
+    subs = [{"start": 3603.5, "end": 3605.0, "text": "a"}]
+    logs = []
+    srt_io.add_leading_blank(subs, logs.append, origin=3600.0)
+    assert (subs[0]["start"], subs[0]["end"]) == (3600.0, 3603.5) and "01:00:00,000 --> 01:00:03,500" in logs[0]
+    subs = [{"start": 3600.0, "end": 3601.0, "text": "a"}]                # 一開始就有字幕：不用插
+    srt_io.add_leading_blank(subs, logs.append, origin=3600.0)
+    assert len(subs) == 1
+
+
 def test_add_leading_blank_skipped_when_already_at_start():
     subs, logs = [{"start": 0.01, "end": 3.0, "text": "a"}], []
     srt_io.add_leading_blank(subs, logs.append)

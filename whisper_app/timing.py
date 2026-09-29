@@ -7,6 +7,42 @@ from .models import Word
 from .srt_io import format_timestamp
 
 
+def detect_timeline_offset(segments: list[dict], duration: float) -> float:
+    """
+    「只對齊」現有字幕時，字幕的時間軸有沒有整個偏移了整數小時。剪輯軟體匯出的字幕常常不是從 0 開始：
+    DaVinci Resolve、Final Cut 的時間軸預設從 01:00:00:00 開始，廣播用的從 10:00:00:00 開始。
+    對齊只會在字幕給的時間前後幾秒內找聲音，差一個小時是永遠找不到的。
+
+    回傳字幕要整體提早幾秒（0.0 = 正常，不用動）：
+        ・絕大多數（>= 90%）字幕本來就落在影片長度內 → 0.0
+        ・扣掉整數小時之後 >= 90% 落在影片長度內 → 那個整數小時（優先試最大的）
+        ・都不行但還有一半以上落在影片長度內（例如影片被截短了）→ 0.0，照常處理，對不上的會被列出來
+        ・都不行 → ValueError，說明字幕跟影片對不起來（選錯影片、或時間軸偏移不是整數小時）
+    """
+    starts = [seg["start"] for seg in segments]
+    if not starts:
+        return 0.0
+    tol = 1.0
+
+    def inside(offset: float) -> int:
+        return sum(1 for s in starts if -tol <= s - offset < duration + tol)
+
+    need = 0.9 * len(starts)
+    if inside(0.0) >= need:
+        return 0.0
+    for hours in range(int(min(starts) // 3600), 0, -1):
+        if inside(hours * 3600.0) >= need:
+            return hours * 3600.0
+    if inside(0.0) >= 0.5 * len(starts):
+        return 0.0
+    ends = max(seg["end"] for seg in segments)
+    raise ValueError(
+        f"字幕的時間跟影片對不起來：字幕從 {format_timestamp(min(starts))} 到 {format_timestamp(ends)}，"
+        f"但影片（音訊）只有 {format_timestamp(duration)}。\n"
+        "請確認選的是同一部影片；如果字幕是剪輯軟體匯出的，而時間軸的起點不是整數小時"
+        "（例如從 00:59:50 開始），需要先把整份字幕平移到從 0 開始，再來對齊。")
+
+
 def apply_alignment(segments: list[dict], result: dict, log_func):
     """
     把對齊結果寫回 segments（原地修改）：整段的起訖時間，以及每個詞的時間（有 words 的話）。
