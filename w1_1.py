@@ -40,6 +40,10 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        text／separated 資料夾，實際用到哪裡會寫在視窗開啟後日誌的第一行。
    11. 人聲分離用獨立程序跑 Demucs（不會跳出黑色視窗，進度會顯示在進度條和日誌裡）。結果存在
        separation_work_dir 底下，同一個檔案（大小與修改時間沒變）再處理時直接重用。
+   12. 右邊的「取消處理」會停掉目前的檔案（連同背景的 Demucs／對齊程序）並清掉排隊中的；
+       處理中直接關閉視窗會先詢問，確定關閉時一樣會把背景程序停掉。
+       也可以把資料夾拖進來：會把裡面（含子資料夾）的影片／音訊依檔名加入佇列，
+       不是影片／音訊的檔案會略過並在日誌說明。認得的副檔名在 MEDIA_EXTENSIONS。
 """
 
 from __future__ import annotations   # 讓 int | None、list[str] 這類標註在 Python 3.9 也能載入
@@ -101,6 +105,7 @@ def _show_fatal_error(message: str):
 
 try:
     import logging
+    import atexit
     import codecs
     import hashlib
     import importlib.util
@@ -116,7 +121,7 @@ try:
     import numpy as np
 
     import tkinter as tk
-    from tkinter import ttk, scrolledtext, filedialog
+    from tkinter import ttk, scrolledtext, filedialog, messagebox
 
     from tkinterdnd2 import TkinterDnD, DND_FILES
 
@@ -142,6 +147,14 @@ SEPARATION_PROGRESS_SHARE = 0.25  # 有勾人聲分離時，分離佔進度條�
 # 實際用到的位置會寫進視窗開啟後日誌的第一行。
 output_dir = r"D:\桌面\whisper\text"
 separation_work_dir = r"D:\桌面\whisper\separated"
+
+# 拖放進來的影片／音訊只接受這些副檔名（拖資料夾進來時，只會挑出裡面符合的）；沒列到的格式可自己加進來
+MEDIA_EXTENSIONS = {
+    ".mp4", ".mkv", ".mov", ".webm", ".avi", ".ts", ".mts", ".m2ts", ".flv", ".wmv", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".ogv",
+    ".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".aif",
+}
+MANY_FILES_CONFIRM = 30   # 一次要加入超過這麼多個檔案（例如不小心拖了整個資料夾）時，先問一下
 
 # === Whisper 設定（固定使用 large-v3）===
 WHISPER_MODEL = "large-v3"
@@ -284,6 +297,89 @@ def format_timestamp(seconds: float) -> str:
 Word = collections.namedtuple("Word", "start end word")
 
 
+class JobCancelled(Exception):
+    """使用者按了「取消處理」（或關閉視窗），這個檔案不用做了。"""
+
+
+def _kill_tree(proc) -> None:
+    """
+    停掉子程序。Windows 上用 taskkill /T 連它底下的子程序一起停（pip 裝的 demucs.exe 只是個啟動器，
+    真正在跑的是它開出來的 python.exe）；其他系統直接 kill。已經結束的不做事。
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, creationflags=_NO_WINDOW, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+class JobControl:
+    """
+    「取消」的狀態，以及背景子程序（Demucs、對齊）的登記處。
+
+    按一次取消 generation 就加 1：在那之前排進佇列的、正在跑的工作全部作廢。用計數而不是旗標，
+    取消剛好發生在工作開始的瞬間也不會漏掉。子程序都要用 spawn() 啟動，取消、關閉視窗、
+    程式結束時才能一起停掉，不會留在背景占著 GPU。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._job_generation = 0   # 目前這個工作是在哪個 generation 排進來的
+        self._procs = set()
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def begin(self, generation: int) -> None:
+        """工作開始：記下它是在哪個 generation 排進來的。"""
+        self._job_generation = generation
+
+    def is_cancelled(self, generation: int | None = None) -> bool:
+        return self._generation != (self._job_generation if generation is None else generation)
+
+    def check(self) -> None:
+        """目前的工作被取消了就丟出 JobCancelled。各處理階段之間呼叫。"""
+        if self.is_cancelled():
+            raise JobCancelled()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._generation += 1
+            procs = list(self._procs)
+        for proc in procs:
+            _kill_tree(proc)
+
+    def spawn(self, cmd, **kwargs):
+        proc = subprocess.Popen(cmd, **kwargs)
+        with self._lock:
+            self._procs.add(proc)
+        if self.is_cancelled():  # 取消剛好發生在啟動的空檔
+            _kill_tree(proc)
+        return proc
+
+    def release(self, proc) -> None:
+        """子程序用完了：還在跑的就停掉，並從登記處拿掉。"""
+        if proc is None:
+            return
+        _kill_tree(proc)
+        with self._lock:
+            self._procs.discard(proc)
+
+
+JOBS = JobControl()
+atexit.register(JOBS.cancel)  # 不管怎麼結束，都不要留下背景程序
+
+
 _PROGRESS_RE = re.compile(r"(\d{1,3})%\|")   # tqdm 進度條的樣子：「 45%|████▌     | …」
 
 
@@ -389,7 +485,7 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
     print(f"[人聲分離] 指令：{' '.join(cmd)}")
     proc = None
     try:
-        proc = subprocess.Popen(
+        proc = JOBS.spawn(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=_child_env(), creationflags=_NO_WINDOW,
         )
@@ -408,6 +504,7 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
             log_func("[人聲分離] " + line)
             tail.append(line)
         returncode = proc.wait()
+        JOBS.check()  # 被取消時子程序是被停掉的，回傳碼不是 0，要先判斷這個
         if returncode != 0:
             detail = "\n".join(tail) if tail else "（沒有輸出）"
             raise RuntimeError(f"Demucs 人聲分離失敗（代碼 {returncode}）：\n{detail}")
@@ -419,8 +516,7 @@ def separate_vocals(input_path: str, work_dir: str, log_func,
         final_dir.parent.mkdir(parents=True, exist_ok=True)
         os.replace(produced.parent, final_dir)
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.kill()
+        JOBS.release(proc)
         shutil.rmtree(tmp_out, ignore_errors=True)
 
     report(1.0)
@@ -525,30 +621,34 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
 
         env = _child_env(HF_HUB_DISABLE_SYMLINKS_WARNING="1")
         log_func("[對齊] 啟動對齊程序…")
-        proc = subprocess.Popen(
+        proc = JOBS.spawn(
             [_console_python(), str(ALIGN_WORKER), str(job_json), str(result_json)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
             creationflags=_NO_WINDOW,
         )
-        tail = collections.deque(maxlen=15)
-        for line in proc.stdout:
-            line = line.rstrip("\r\n")
-            if line.startswith("PROGRESS "):
-                done, total = line.split()[1:3]
-                progress_func(int(done) / max(int(total), 1))
-            elif line.startswith("LOG "):
-                log_func("[對齊] " + line[4:])
-            elif line.startswith("ERROR "):
-                log_func("!!! [對齊] " + line[6:])
-                tail.append(line[6:])
-            elif line.strip():
-                print(line)  # transformers 的警告、下載進度等只寫進 log 檔
-                tail.append(line)
-        returncode = proc.wait()
-        if returncode != 0 or not result_json.exists():
-            detail = "\n".join(tail) if tail else "（沒有輸出）"
-            raise RuntimeError(f"對齊程序失敗（代碼 {returncode}）：\n{detail}")
+        try:
+            tail = collections.deque(maxlen=15)
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                if line.startswith("PROGRESS "):
+                    done, total = line.split()[1:3]
+                    progress_func(int(done) / max(int(total), 1))
+                elif line.startswith("LOG "):
+                    log_func("[對齊] " + line[4:])
+                elif line.startswith("ERROR "):
+                    log_func("!!! [對齊] " + line[6:])
+                    tail.append(line[6:])
+                elif line.strip():
+                    print(line)  # transformers 的警告、下載進度等只寫進 log 檔
+                    tail.append(line)
+            returncode = proc.wait()
+            JOBS.check()  # 被取消時子程序是被停掉的，回傳碼不是 0，要先判斷這個
+            if returncode != 0 or not result_json.exists():
+                detail = "\n".join(tail) if tail else "（沒有輸出）"
+                raise RuntimeError(f"對齊程序失敗（代碼 {returncode}）：\n{detail}")
+        finally:
+            JOBS.release(proc)
 
         result = json.loads(result_json.read_text(encoding="utf-8"))
 
@@ -775,6 +875,7 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
             SEPARATION_PROGRESS_SHARE + (1 - SEPARATION_PROGRESS_SHARE) * frac)
     else:
         audio_input = str(media_path)
+    JOBS.check()
 
     result = run_alignment(audio_input, segments, log_func, progress_func)
     apply_alignment(segments, result, log_func)
@@ -786,6 +887,7 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
         add_leading_blank(subs, log_func)
     report_alignment(segments, subs, log_func)
 
+    JOBS.check()
     output_path = os.path.join(output_dir, f"{srt_path.stem}_align.srt")
     write_srt(output_path, subs)
     progress_func(1.0)
@@ -1071,6 +1173,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
             SEPARATION_PROGRESS_SHARE + (1 - SEPARATION_PROGRESS_SHARE) * frac)
     else:
         transcribe_input = str(input_path)
+    JOBS.check()
 
     model = get_model(log_func)
 
@@ -1094,6 +1197,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     total = max(info.duration, 0.01)
     raw = []  # Whisper 原本的片段（還沒拆）
     for segment in segments:
+        JOBS.check()  # Whisper 是在這個迴圈裡一段一段轉錄的，取消最慢等到目前這一段做完
         text = segment.text.strip()
         words = ([Word(w.start, w.end, w.word) for w in segment.words]
                  if use_split and segment.words else None)
@@ -1110,6 +1214,8 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
                 transcribe_input, raw, log_func,
                 lambda frac: progress_func(transcribe_weight + (1 - transcribe_weight) * frac),
             )
+        except JobCancelled:
+            raise
         except Exception as e:
             traceback.print_exc()
             log_func(f"!!! [對齊] 失敗：{e}（這次先輸出未對齊的字幕）")
@@ -1143,6 +1249,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         report_alignment(raw, subs, log_func)  # 插完空白字幕再列，編號才跟 SRT 一致
 
     align_tag = "_align" if align_result is not None else ""
+    JOBS.check()
     output_filename = f"{base}_{WHISPER_MODEL}_{sep_tag}{align_tag}.srt"
     output_path = os.path.join(output_dir, output_filename)
     write_srt(output_path, subs)
@@ -1150,6 +1257,50 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     progress_func(1.0)
     log_func(f"=== 完成，字幕已儲存：{output_path} ===\n")
     return output_path
+
+
+def _natural_key(path) -> list:
+    """檔名裡的數字照大小排（第2話 排在 第10話 前面）。"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(path))]
+
+
+def collect_dropped_files(paths: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """
+    整理拖進來的東西，回傳 (影片／音訊, .srt, 略過的說明)。
+    資料夾會展開成裡面（含子資料夾）的影片／音訊，依檔名排序；資料夾裡的 .srt 不算，
+    避免拖資料夾就意外進了「只對齊」模式。不存在的、不是影片／音訊的、以「.」開頭的隱藏檔
+    （例如 ._xxx.mp4）都略過；同一個檔案不管拖幾次只算一次。
+    """
+    media, srts, skipped, seen = [], [], [], set()
+
+    def add(bucket: list, p: Path) -> None:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            bucket.append(str(p))
+
+    for raw in paths:
+        p = Path(raw)
+        suffix = p.suffix.lower()
+        if p.is_dir():
+            found = sorted((f for f in p.rglob("*")
+                            if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in MEDIA_EXTENSIONS),
+                           key=_natural_key)
+            if not found:
+                skipped.append(f"{p.name}（資料夾裡沒有影片或音訊）")
+            for f in found:
+                add(media, f)
+        elif not p.is_file():
+            skipped.append(f"{p.name or raw}（找不到這個檔案）")
+        elif p.name.startswith("."):
+            skipped.append(p.name)
+        elif suffix == ".srt":
+            add(srts, p)
+        elif suffix in MEDIA_EXTENSIONS:
+            add(media, p)
+        else:
+            skipped.append(p.name)
+    return media, srts, skipped
 
 
 # =========================================================
@@ -1336,6 +1487,11 @@ class App:
         # --- 背景處理：佇列 + 工作執行緒 ---
         self.file_queue = queue.Queue()
         self.ui_queue = queue.Queue()
+        self._pending = 0  # 排隊中＋處理中的工作數，關閉視窗時用來判斷要不要先問
+        self._pending_lock = threading.Lock()
+        self._reported_errors: set[str] = set()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.report_callback_exception = self._report_callback_exception
         threading.Thread(target=self.worker_loop, daemon=True).start()
         self.root.after(100, self.poll_ui_queue)
         for note in STARTUP_NOTES:
@@ -1472,6 +1628,9 @@ class App:
         ttk.Label(
             status_row, textvariable=self.status_var, style="Status.TLabel",
         ).pack(side="left")
+        ttk.Button(
+            status_row, text="取消處理", style="Small.RedOutline.TButton", command=self.cancel_all,
+        ).pack(side="right")
 
         self.progress = ttk.Progressbar(
             inner, mode="determinate", maximum=100, style="Red.Horizontal.TProgressbar",
@@ -1618,7 +1777,9 @@ class App:
                     self.status_var.set(" " + str(payload))
         except queue.Empty:
             pass
-        self.root.after(100, self.poll_ui_queue)
+        finally:
+            # 就算處理某一筆時出錯，也要讓計時器繼續跑，不然畫面之後就不會更新了
+            self.root.after(100, self.poll_ui_queue)
 
     def _set_all_hotwords(self, checked: bool):
         for var in self.hotword_vars.values():
@@ -1635,8 +1796,13 @@ class App:
     def _handle_dropped(self, paths: list[str]):
         use_sep = self.use_sep_var.get()
         add_blank = self.add_blank_var.get()
-        srt_files = [p for p in paths if Path(p).suffix.lower() == ".srt"]
-        media_files = [p for p in paths if Path(p).suffix.lower() != ".srt"]
+        media_files, srt_files, skipped = collect_dropped_files(paths)
+        if skipped:
+            shown = "、".join(skipped[:5]) + (f" 等 {len(skipped)} 個" if len(skipped) > 5 else "")
+            self.log(f">>> 略過 {len(skipped)} 個不是影片／音訊的項目：{shown}")
+        if not media_files and not srt_files:
+            self.log(">>> 沒有可以處理的影片或音訊檔案")
+            return
 
         # 有 .srt → 只對齊模式：拖進來的影片只拿來配對，不會重新轉錄
         if srt_files:
@@ -1648,7 +1814,7 @@ class App:
                         parent=self.root,
                         title=f"選擇「{Path(srt).name}」對應的影片或音訊",
                         filetypes=[
-                            ("影片／音訊", "*.mp4 *.mkv *.mov *.webm *.avi *.ts *.m4a *.mp3 *.wav *.flac *.aac *.ogg"),
+                            ("影片／音訊", " ".join("*" + ext for ext in sorted(MEDIA_EXTENSIONS))),
                             ("所有檔案", "*.*"),
                         ],
                     )
@@ -1656,8 +1822,8 @@ class App:
                     self.log(f">>> 略過「{Path(srt).name}」：沒有選擇對應的影片")
                     continue
                 used_media.add(media)
-                self.file_queue.put({"kind": "align_only", "srt": srt, "media": media,
-                                     "use_sep": use_sep, "add_blank": add_blank})
+                self._enqueue({"kind": "align_only", "srt": srt, "media": media,
+                               "use_sep": use_sep, "add_blank": add_blank})
                 self.log(f">>> 已加入佇列（只對齊）：{Path(srt).name}  ⇄  {Path(media).name}")
             for m in media_files:
                 if m not in used_media:
@@ -1669,8 +1835,12 @@ class App:
         use_align = self.use_align_var.get()
         use_split = self.use_split_var.get()
         selected_hotwords = [w for w, var in self.hotword_vars.items() if var.get()]
+        if len(media_files) > MANY_FILES_CONFIRM and not messagebox.askyesno(
+                "Whisper 字幕產生器", f"這次要加入 {len(media_files)} 個檔案，全部都處理嗎？", parent=self.root):
+            self.log(f">>> 已取消加入（{len(media_files)} 個檔案）")
+            return
         for p in media_files:
-            self.file_queue.put({
+            self._enqueue({
                 "kind": "transcribe", "path": p, "use_sep": use_sep, "use_align": use_align,
                 "use_split": use_split, "hotwords": selected_hotwords, "add_blank": add_blank,
             })
@@ -1695,9 +1865,14 @@ class App:
     def worker_loop(self):
         while True:
             job = self.file_queue.get()
-            is_align_only = job["kind"] == "align_only"
-            name = Path(job["srt"] if is_align_only else job["path"]).name
+            name = "（未知的工作）"
             try:
+                is_align_only = job["kind"] == "align_only"
+                name = Path(job["srt"] if is_align_only else job["path"]).name
+                if JOBS.is_cancelled(job["gen"]):
+                    self.log(f">>> 略過已取消的：{name}")
+                    continue
+                JOBS.begin(job["gen"])
                 self.set_status(f"{'對齊中' if is_align_only else '處理中'}：{name}")
                 self.set_progress(0)
                 if is_align_only:
@@ -1710,9 +1885,78 @@ class App:
                                  self.log, self.set_progress,
                                  add_blank=job["add_blank"])
                 self.set_status("完成，等待下一個檔案…")
+            except JobCancelled:
+                self.log(f">>> 已取消：{name}")
+                self.set_status("已取消")
+                self.set_progress(0)
             except Exception as e:
-                self.log(f"!!! 處理「{name}」時發生錯誤：{e}")
+                traceback.print_exc()  # 完整的錯誤堆疊寫進 log 檔
+                where = f"（詳細內容在 {LOG_FILE}）" if LOG_FILE else ""
+                self.log(f"!!! 處理「{name}」時發生錯誤：{type(e).__name__}: {e}{where}")
                 self.set_status("發生錯誤，請查看上方日誌")
+            finally:
+                self._job_finished()
+
+    # ---- 排隊數量、取消、關閉視窗 ----
+    def _enqueue(self, job: dict) -> None:
+        job["gen"] = JOBS.generation  # 之後按了取消，這個 generation 之前排進來的工作都會作廢
+        with self._pending_lock:
+            self._pending += 1
+        self.file_queue.put(job)
+
+    def _job_finished(self) -> None:
+        with self._pending_lock:
+            self._pending -= 1
+
+    def _is_working(self) -> bool:
+        with self._pending_lock:
+            return self._pending > 0
+
+    def cancel_all(self):
+        """取消：停掉目前處理的檔案（連同背景的 Demucs／對齊程序），並清掉排隊中的。"""
+        if not self._is_working():
+            self.log(">>> 目前沒有處理中或排隊中的檔案")
+            return
+        JOBS.cancel()  # 先作廢，之後不管 worker 取到哪個舊工作都會被略過
+        dropped = 0
+        try:
+            while True:
+                self.file_queue.get_nowait()
+                dropped += 1
+        except queue.Empty:
+            pass
+        with self._pending_lock:
+            self._pending -= dropped
+            running = self._pending > 0
+        self.log(">>> 已要求取消" + (f"，並清除排隊中的 {dropped} 個檔案" if dropped else ""))
+        if running:
+            self.set_status("正在取消…")
+        else:
+            self.set_status("已取消，等待拖入檔案…")
+            self.set_progress(0)
+
+    def _on_close(self):
+        if self._is_working() and not messagebox.askokcancel(
+                "Whisper 字幕產生器",
+                "還有檔案在處理中（或排隊中），現在關閉會中止它們。\n\n確定要關閉嗎？",
+                parent=self.root):
+            return
+        JOBS.cancel()
+        self.root.destroy()
+
+    def _report_callback_exception(self, exc, val, tb):
+        """Tk 事件處理函式（拖放、按鈕、計時器）裡沒接住的例外：寫進 log 檔，並提示使用者。"""
+        traceback.print_exception(exc, val, tb)
+        key = f"{exc.__name__}: {val}"
+        if key in self._reported_errors:  # 同一個錯誤（例如計時器每 0.1 秒一次）只提示一次
+            return
+        self._reported_errors.add(key)
+        where = f"\n\n詳細錯誤已寫入：\n{LOG_FILE}" if LOG_FILE else ""
+        self.log(f"!!! 介面發生錯誤：{key}")
+        try:
+            messagebox.showerror("Whisper 字幕產生器 - 發生錯誤", f"{key}{where}", parent=self.root)
+        except Exception:
+            pass
 
 
 def main():
