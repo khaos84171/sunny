@@ -74,7 +74,7 @@ def run_pipeline(monkeypatch, tmp_path):
         audio = np.load(tmp_path / "audio.npy")
         monkeypatch.setattr(aligner, "decode_audio", lambda path, sampling_rate=16000: audio)
         logs = []
-        out = pipeline.align_existing_srt(str(tmp_path / "rough.srt"), "/x/影片.mp4", False, logs.append, lambda p: None,
+        out = pipeline.align_existing_srt(str(tmp_path / "rough.srt"), "/x/影片.mp4", logs.append, lambda p: None,
                                           add_blank=False)
         return out, logs
     return run

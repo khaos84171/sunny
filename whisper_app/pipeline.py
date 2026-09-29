@@ -17,9 +17,9 @@ from .timing import apply_alignment, finalize_aligned_timing, report_alignment
 from .transcribe import build_hotwords, get_model, looks_like_hallucination
 
 
-def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
+def align_existing_srt(srt_path: str, media_path: str,
                        log_func, progress_func, add_blank: bool = True) -> str:
-    """只對齊：讀取現有 SRT 的文字與大略時間，用影片音訊重新校正時間戳，不跑 Whisper。"""
+    """只對齊：讀取現有 SRT 的文字與大略時間，用影片音訊重新校正時間戳，不跑 Whisper，也不做人聲分離。"""
     srt_path = Path(srt_path)
     media_path = Path(media_path)
 
@@ -35,22 +35,10 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
     log_func(f"讀到 {len(segments)} 條字幕"
              + (f"（另有 {n_blank} 條空白字幕，已略過）" if n_blank else ""))
 
-    # 有做人聲分離時，分離佔進度條的前一段，對齊縮進剩下的部分
-    overall_progress = progress_func
-    if use_sep:
-        audio_input = separate_vocals(
-            str(media_path), runtime.separation_work_dir, log_func,
-            device=config.SEPARATION_DEVICE, model_name=config.SEPARATION_MODEL,
-            segment=config.SEPARATION_SEGMENT,
-            progress_func=lambda frac: overall_progress(config.SEPARATION_PROGRESS_SHARE * frac),
-        )
-        progress_func = lambda frac: overall_progress(
-            config.SEPARATION_PROGRESS_SHARE + (1 - config.SEPARATION_PROGRESS_SHARE) * frac)
-    else:
-        audio_input = str(media_path)
+    # 只對齊不做人聲分離：直接用影片／音訊本身（不管視窗上有沒有勾「先用 Demucs 分離人聲」）
     JOBS.check()
 
-    result = run_alignment(audio_input, segments, log_func, progress_func)
+    result = run_alignment(str(media_path), segments, log_func, progress_func)
     apply_alignment(segments, result, log_func)
     # 輸出用另一份，檢查報告才看得到後處理（提早出現、防重疊）之前的對齊時間
     subs = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],

@@ -137,21 +137,37 @@ def test_align_only_progress_and_output_name(monkeypatch, tmp_path):
     srt = tmp_path / "a.srt"
     srt.write_text("1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n\n2\n00:00:04,000 --> 00:00:06,000\nさようなら\n", encoding="utf-8")
     monkeypatch.setattr(pipeline, "run_alignment", fake_align)
-    monkeypatch.setattr(pipeline, "separate_vocals", lambda *a, **k: (k["progress_func"](1.0), "/x/v.wav")[1])
-    for use_sep, first_progress in ((True, config.SEPARATION_PROGRESS_SHARE), (False, 0.5)):
-        prog = []
-        out = pipeline.align_existing_srt(str(srt), "/x/影片.mp4", use_sep, lambda m: None, prog.append)
-        assert Path(out).name == "a_align.srt" and prog[0] == pytest.approx(first_progress) and prog[-1] == 1.0
-        assert prog == sorted(prog)
+    prog = []
+    out = pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, prog.append)
+    assert Path(out).name == "a_align.srt" and prog[0] == pytest.approx(0.5) and prog[-1] == 1.0
+    assert prog == sorted(prog)
     monkeypatch.setattr(config, "ALIGN_REFINE", False)
-    assert Path(pipeline.align_existing_srt(str(srt), "/x/影片.mp4", False, lambda m: None, lambda p: None)).name == "a_align_ctc.srt"
+    assert Path(pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, lambda p: None)).name == "a_align_ctc.srt"
+
+
+def test_align_only_never_separates_vocals(monkeypatch, tmp_path):
+    """只對齊直接用原始影片音訊，不會呼叫 Demucs（不管視窗上有沒有勾人聲分離）。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n", encoding="utf-8")
+    aligned_inputs = []
+
+    def recording_align(audio, segments, log_func, progress_func):
+        aligned_inputs.append(audio)
+        return fake_align(audio, segments, log_func, progress_func)
+
+    def no_separation(*a, **k):
+        raise AssertionError("只對齊不該做人聲分離")
+    monkeypatch.setattr(pipeline, "run_alignment", recording_align)
+    monkeypatch.setattr(pipeline, "separate_vocals", no_separation)
+    pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, lambda p: None)
+    assert aligned_inputs == ["/x/影片.mp4"]
 
 
 def test_align_only_rejects_srt_without_subtitles(tmp_path):
     srt = tmp_path / "empty.srt"
     srt.write_text("這不是字幕", encoding="utf-8")
     with pytest.raises(ValueError, match="沒有讀到任何字幕"):
-        pipeline.align_existing_srt(str(srt), "/x/影片.mp4", False, lambda m: None, lambda f: None)
+        pipeline.align_existing_srt(str(srt), "/x/影片.mp4", lambda m: None, lambda f: None)
 
 
 # ---------------- 取消 ----------------

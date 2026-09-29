@@ -572,7 +572,7 @@ class App:
                     continue
                 used_media.add(media)
                 self._enqueue({"kind": "align_only", "srt": srt, "media": media,
-                               "use_sep": use_sep, "add_blank": add_blank})
+                               "add_blank": add_blank})
                 self.log(f">>> 已加入佇列（只對齊）：{Path(srt).name}  ⇄  {Path(media).name}")
             for m in media_files:
                 if m not in used_media:
@@ -625,7 +625,7 @@ class App:
                 self.set_status(f"{'對齊中' if is_align_only else '處理中'}：{name}")
                 self.set_progress(0)
                 if is_align_only:
-                    align_existing_srt(job["srt"], job["media"], job["use_sep"],
+                    align_existing_srt(job["srt"], job["media"],
                                        self.log, self.set_progress,
                                        add_blank=job["add_blank"])
                 else:
