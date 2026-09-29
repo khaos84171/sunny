@@ -99,13 +99,15 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         transcribe_input = str(input_path)
     JOBS.check()
 
-    model = get_model(log_func)
+    # 載入模型、解碼音訊、轉錄每一段都是停不下來的呼叫：用可中斷的方式等，按取消才能馬上反應
+    model = JOBS.run_interruptibly(get_model, log_func)
 
     # hotwords 由前端勾選傳入；每部影片出場的人不同，只放這次用得到的詞
     hotwords = build_hotwords(hotword_list)
     log_func(f"本次使用的 hotwords：{hotwords if hotwords else '（無）'}")
 
-    segments, info = model.transcribe(
+    segments, info = JOBS.run_interruptibly(
+        model.transcribe,
         transcribe_input,
         **config.TRANSCRIBE_OPTIONS,
         word_timestamps=use_split,  # 拆分需要每個詞的時間
@@ -120,8 +122,8 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     transcribe_weight = 0.8 if use_align else 1.0
     total = max(info.duration, 0.01)
     raw = []  # Whisper 原本的片段（還沒拆）
-    for segment in segments:
-        JOBS.check()  # Whisper 是在這個迴圈裡一段一段轉錄的，取消最慢等到目前這一段做完
+    for segment in JOBS.iter_interruptibly(segments):  # Whisper 是在這個迴圈裡一段一段轉錄的；按取消不用等它做完手上這段
+        JOBS.check()
         text = segment.text.strip()
         no_speech = getattr(segment, "no_speech_prob", None)
         if looks_like_hallucination(text, no_speech, getattr(segment, "avg_logprob", None)):

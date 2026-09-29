@@ -106,7 +106,7 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
         raise FileNotFoundError(f"找不到 {config.ALIGN_WORKER.name}，請把它放在 {config.BASE_DIR}")
 
     log_func(f"[對齊] 讀取音訊：{audio_path}")
-    audio = decode_audio(audio_path, sampling_rate=config.SAMPLE_RATE)
+    audio = JOBS.run_interruptibly(decode_audio, audio_path, sampling_rate=config.SAMPLE_RATE)  # 長影片要解碼好幾秒
     duration = len(audio) / config.SAMPLE_RATE
 
     with tempfile.TemporaryDirectory(prefix="whisper_align_") as tmp:
