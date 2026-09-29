@@ -1,0 +1,8 @@
+# 執行時產生的檔案
+__pycache__/
+*.pyc
+.pytest_cache/
+whisper_app.log*
+whisper_settings.json
+whisper_settings.json.tmp
+whisper_startup_error.txt
