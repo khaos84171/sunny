@@ -1,4 +1,5 @@
-"""align_worker.py（獨立程序）：結果跟重構前逐項一致、常駐模式、顯存搬移、閒置逾時、出錯、萬用字元。用假的 torch/transformers。"""
+"""align_worker.py（獨立程序）：黃金檔（結果不變）、常駐模式、顯存搬移、閒置逾時、出錯、萬用字元、frame 時間換算。用假的 torch/transformers。
+聲音能量微調與交叉驗證另外在 test_align_refine.py。"""
 import importlib
 import json
 import sys
@@ -29,15 +30,33 @@ def _flatten(value):
     return [float(value)]
 
 
-# ---------------- 跟重構前的結果一致（黃金檔）----------------
+# ---------------- 結果不變（黃金檔）----------------
 @pytest.mark.parametrize("seed", [11, 13])
-def test_matches_the_golden_output_of_the_pre_refactor_worker(tmp_path, seed):
+def test_matches_the_golden_output(tmp_path, seed):
     job = make_align_job(tmp_path / "job", seed=seed)
     golden = json.loads((TESTS / "golden" / f"align_seed{seed}_result.json").read_text(encoding="utf-8"))
     golden_stdout = (TESTS / "golden" / f"align_seed{seed}_stdout.txt").read_text(encoding="utf-8")
     code, out, _ = run_worker([job, tmp_path / "r.json"])
     assert code == 0 and out.replace("\r\n", "\n") == golden_stdout
     assert_same_result(json.loads((tmp_path / "r.json").read_text(encoding="utf-8")), golden)
+
+
+@pytest.mark.parametrize("seed", [11, 13])
+def test_only_difference_from_the_old_frame_time_estimate_is_a_small_shift(tmp_path, seed):
+    """
+    golden/legacy/ 是修正 frame 時間換算之前的輸出。換算改成精確的 0.02 秒之後，
+    哪些句子對得上、哪一輪、信心都必須完全一樣，只有時間差一點點：最多半格（10 毫秒），而且只會變早。
+    """
+    job = make_align_job(tmp_path / "job", seed=seed)
+    legacy = json.loads((TESTS / "golden" / "legacy" / f"align_seed{seed}_result.json").read_text(encoding="utf-8"))
+    code, _, _ = run_worker([job, tmp_path / "r.json"])
+    new = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert code == 0 and new["wide"] == legacy["wide"] and new["confs"] == legacy["confs"]
+    for key in ("spans", "word_spans"):
+        a, b = np.array(_flatten(new[key])), np.array(_flatten(legacy[key]))
+        assert a.shape == b.shape and ((a == -1) == (b == -1)).all()          # 哪些是 null 完全一樣
+        diff = (a - b)[a != -1]
+        assert diff.max() <= 1e-9 and diff.min() >= -0.0101 and diff.min() < -0.001
 
 
 def test_serve_mode_gives_the_same_results_as_one_shot_mode(tmp_path):
@@ -121,19 +140,6 @@ def test_one_shot_command_line_still_works(tmp_path):
 
 
 # ---------------- 萬用字元 ----------------
-@pytest.fixture
-def worker_module(monkeypatch):
-    """在同一個程序裡載入 align_worker（用假的 torch/transformers）。"""
-    monkeypatch.syspath_prepend(str(TESTS / "ml_stubs"))
-    monkeypatch.syspath_prepend(str(ROOT))
-    for name in ("align_worker", "torch", "transformers"):
-        sys.modules.pop(name, None)
-    module = importlib.import_module("align_worker")
-    yield module
-    for name in ("align_worker", "torch", "transformers"):
-        sys.modules.pop(name, None)
-
-
 def real_char_columns(aligner):
     special = {"<pad>", "<s>", "</s>", "<unk>", "|"}
     return [v for k, v in aligner.vocab.items() if k not in special]
@@ -149,6 +155,47 @@ def test_wildcard_column_ignores_special_tokens(worker_module, monkeypatch, spec
     real = lp[:, real_char_columns(aligner)].max(axis=1)
     np.testing.assert_allclose(lp[:, aligner.star_id], real - worker_module.STAR_PENALTY)
     assert seconds == pytest.approx(0.02, rel=0.05)
+
+
+# ---------------- frame 時間換算 ----------------
+@pytest.mark.parametrize("samples", [24000, 24100, 33333, 160007, 16000 * 26])
+def test_frame_length_is_the_exact_model_stride(worker_module, samples):
+    """第 t 個 frame 從第 t * 320 個取樣點開始 = t * 0.02 秒，跟視窗長度無關。
+    以前用「視窗秒數 / frame 數」估，越靠近視窗尾端越晚，最多晚一整格（20 毫秒）。"""
+    aligner = worker_module.Aligner("x", "cpu")
+    assert aligner.frame_stride == 320
+    lp, seconds = aligner.log_probs(np.zeros(samples, dtype=np.float32), 16000)
+    assert seconds == 0.02
+
+
+def test_frame_length_with_the_frame_count_of_the_real_wav2vec2(worker_module):
+    """真的 wav2vec2 的 frame 數是 (取樣點 - 400) // 320 + 1（假模型是 取樣點 // 320），兩種都要算得出 0.02。"""
+    aligner = worker_module.Aligner("x", "cpu")
+    samples = 16000 * 5
+    frames = (samples - 400) // 320 + 1
+    aligner._posteriors = lambda chunk, sr: np.full((frames, len(aligner.vocab)), -5.0)
+    _, seconds = aligner.log_probs(np.zeros(samples, dtype=np.float32), 16000)
+    assert seconds == 0.02 and (samples / 16000) / frames > 0.02          # 舊的估法會多估
+
+
+def test_frame_length_falls_back_to_an_estimate_when_the_stride_is_unknown_or_inconsistent(worker_module):
+    aligner = worker_module.Aligner("x", "cpu")
+    samples = 24100
+    lp, _ = aligner.log_probs(np.zeros(samples, dtype=np.float32), 16000)
+    estimate = (samples / 16000) / lp.shape[0]
+    aligner.frame_stride = None                                         # 取不到模型步幅
+    assert aligner.log_probs(np.zeros(samples, dtype=np.float32), 16000)[1] == pytest.approx(estimate)
+    aligner.frame_stride = 640                                          # 步幅跟實際 frame 數對不上（不是這種模型）
+    assert aligner.log_probs(np.zeros(samples, dtype=np.float32), 16000)[1] == pytest.approx(estimate)
+
+
+def test_missing_or_odd_model_config_does_not_break_loading(worker_module, monkeypatch):
+    from types import SimpleNamespace
+
+    import transformers                       # tests/ml_stubs 裡假的（worker_module 已把它放進搜尋路徑）
+    for config in (None, SimpleNamespace(), SimpleNamespace(conv_stride=None), SimpleNamespace(conv_stride="abc")):
+        monkeypatch.setattr(transformers.Wav2Vec2ForCTC, "config", config, raising=False)
+        assert worker_module.Aligner("x", "cpu").frame_stride is None
 
 
 def test_wildcard_candidates_exclude_blank_delimiter_and_special_tokens(worker_module):

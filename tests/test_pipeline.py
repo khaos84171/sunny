@@ -88,6 +88,14 @@ def test_output_file_names(stub, sep, align, split, name):
     assert Path(out).name == name and Path(out).parent == Path(runtime.output_dir)
 
 
+def test_output_name_says_when_the_sound_refinement_is_off(stub, monkeypatch):
+    """關掉聲音微調（ALIGN_REFINE = False）的輸出加上 _ctc，不會蓋掉微調版，方便拿去跟標準答案比較。"""
+    monkeypatch.setattr(config, "ALIGN_REFINE", False)
+    assert Path(stub.run(True, True, True)[0]).name == "影片_large-v3_sep_align_ctc.srt"
+    assert Path(stub.run(False, True, False)[0]).name == "影片_large-v3_nosep_align_ctc_nosplit.srt"
+    assert Path(stub.run(False, False, True)[0]).name == "影片_large-v3_nosep.srt"       # 沒做對齊就沒有這個標記
+
+
 def test_failed_alignment_still_writes_an_unaligned_file(stub, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("對齊壞了")
@@ -135,6 +143,8 @@ def test_align_only_progress_and_output_name(monkeypatch, tmp_path):
         out = pipeline.align_existing_srt(str(srt), "/x/影片.mp4", use_sep, lambda m: None, prog.append)
         assert Path(out).name == "a_align.srt" and prog[0] == pytest.approx(first_progress) and prog[-1] == 1.0
         assert prog == sorted(prog)
+    monkeypatch.setattr(config, "ALIGN_REFINE", False)
+    assert Path(pipeline.align_existing_srt(str(srt), "/x/影片.mp4", False, lambda m: None, lambda p: None)).name == "a_align_ctc.srt"
 
 
 def test_align_only_rejects_srt_without_subtitles(tmp_path):

@@ -34,6 +34,18 @@
     注意 CTC 的特性：每個字只會在開始發音的那一兩個 frame 出現，所以一個詞的「終點」
     是最後一個字開始發音的位置，字拉長音的部分會算在跟下一個詞之間的空白裡。
 
+用聲音能量微調每個詞的起訖 + 交叉驗證（params.refine.enabled 為真時）：
+    CTC 的字通常落在母音附近：詞的起點常晚 0.03～0.1 秒（子音已經開始了）、終點常早 0.05～0.15 秒（尾音還沒結束）。
+    對齊完之後，再用聲音能量（每 5 毫秒一格，完全獨立於文字與模型）在每個詞的起訖附近找「靜音 → 有聲」和
+    「有聲 → 靜音」的位置，把邊界貼過去。動作很保守：
+        ・只有邊界前後找得到明確的靜音／有聲交界才動，而且有幅度上限（起點最多提早 0.15 秒等），
+          不會越過前一個詞的終點與下一個詞的起點
+        ・連續語音（沒有停頓可貼）、背景聲太大（對比不夠）時維持 CTC 的時間
+    同時它就是交叉驗證：每個詞的起點、終點各記一個狀態（result.json 的 checks）——
+        ok 兩種算法一致（差距在 agree_sec 內）／moved 依聲音修正／cont 連續語音無法判定／
+        noisy 背景聲太大無法判定／silent CTC 說有字的地方卻聽不到聲音（可能是 Whisper 幻覺）
+    處理完會在日誌印出一致率、修正量的統計。
+
 用法：
     python align_worker.py --serve <閒置秒數>
         常駐模式（w1_1.py 用這個）：工作一行一個從 stdin 讀進來
@@ -43,11 +55,14 @@
     python align_worker.py job.json result.json
         單次模式（手動測試用）：做完一個工作就結束。
     job.json    {"audio_npy", "segments": [{"start","end","text","words"(可省略)}, ...],
-                 "model_name", "device", "sample_rate", "params": {...}}
+                 "model_name", "device", "sample_rate",
+                 "params": {"pad_sec", "edge_sec", "wide_sec", "batch_sec", "low_conf", "max_inner_gap",
+                            "refine": {"enabled", "back_sec", ...}(可省略＝不微調)}}
                  words = 這句拆成詞的文字 list，接起來要等於 text；沒給就當整句是一個詞
     result.json {"spans": [[起點秒, 終點秒] 或 null, ...],
                  "confs": [0～1 或 null, ...], "wide": [這句是否用第二輪結果, ...],
-                 "word_spans": [[[詞起點, 詞終點] 或 null（詞裡沒有會發音的字）, ...] 或 null, ...]}
+                 "word_spans": [[[詞起點, 詞終點] 或 null（詞裡沒有會發音的字）, ...] 或 null, ...],
+                 "checks": [[[起點狀態, 起點修正秒數, 終點狀態, 終點修正秒數] 或 null, ...每個詞] 或 null, ...]}
 stdout 每行一則訊息給主程式：
     "LOG <文字>"、"PROGRESS <已完成> <總數>"、"ERROR <文字>"、（常駐模式）"START"、"END <代碼>"
 """
@@ -174,6 +189,192 @@ def ctc_align(log_probs: np.ndarray, tokens: list[int], blank_id: int):
 
 
 # =========================================================
+# === 用聲音能量微調邊界 + 交叉驗證 ===
+# =========================================================
+# 為什麼需要：CTC 的字只會在「模型確定聽到那個字」的一兩個 frame 冒出來（很尖的峰），
+# 位置通常落在母音附近，而不是子音開始的地方；字唸完之後拖長的尾音也不算在內。
+# 所以只靠 CTC，詞的起點常常晚 0.03～0.1 秒、終點常常早 0.05～0.15 秒。
+# 聲音能量（有沒有聲音、什麼時候開始有）是完全獨立的另一種量測，不會有這種偏差：
+#   ・用它把邊界貼到聲音真的開始／結束的位置（只在邊界前後找得到明確的「靜音→有聲」時才動）
+#   ・同時它就是交叉驗證：CTC 跟聲音兩種算法差多少、有沒有一致，都記下來回報
+ENV_WIN_SEC = 0.02      # 能量的計算視窗
+ENV_HOP_SEC = 0.005     # 每 5 毫秒算一格（wav2vec2 一格 20 毫秒，這裡細很多）
+PRE_EMPHASIS = 0.97     # 預強調：壓低低頻（背景音樂的低音、風聲），突顯子音的高頻
+MIN_UNIT_SEC = 0.02     # 微調之後一個詞至少要有這麼長，否則放棄微調
+
+REFINE_DEFAULTS = {
+    "back_sec": 0.15,          # 起點最多往前（提早）找幾秒
+    "fwd_sec": 0.06,           # 起點最多往後（延遲）找幾秒（CTC 起點落在還沒有聲音的地方時）
+    "end_fwd_sec": 0.30,       # 終點最多往後（延後）找幾秒，找聲音真正結束的地方
+    "end_back_sec": 0.08,      # 終點最多往前（提早）找幾秒（CTC 終點已經落在靜音裡時）
+    "min_contrast_db": 15.0,   # 附近「最大聲」跟「背景」至少差幾 dB 才判定得了（背景聲太大就放棄）
+    "thr_frac": 0.30,          # 有聲／無聲的門檻：背景到最大聲之間（dB）的 30% 處
+    "max_range_db": 30.0,      # 門檻至少要比最大聲低這麼多以內（背景近乎全靜音時，不要把殘留的雜訊當成聲音）
+    "dip_sec": 0.03,           # 聲音中間短暫掉下去（例如「っ」前的閉鎖）不超過這麼久，還算同一段聲音
+    "agree_sec": 0.04,         # CTC 跟聲音的差距不超過這麼多秒 → 視為「一致」
+    "ctx_sec": 1.0,            # 估背景與最大聲時，詞前後各看幾秒
+    "quiet_db": 20.0,          # 詞附近整片都比一般說話音量小這麼多 dB → 判定「該處聽不到聲音」
+}
+
+STATUS_LABELS = {"ok": "一致", "moved": "依聲音修正", "silent": "該處聽不到聲音",
+                 "cont": "連續語音", "noisy": "背景聲太大或沒有停頓"}
+
+
+def energy_envelope_db(audio, sr: int) -> np.ndarray:
+    """每 5 毫秒一格的短時能量（dB，只有相對意義）。分段計算，長影片也不會吃太多記憶體。"""
+    win, hop = int(round(ENV_WIN_SEC * sr)), int(round(ENV_HOP_SEC * sr))
+    n_frames = (len(audio) - win) // hop + 1 if len(audio) >= win else 0
+    env = np.empty(n_frames, dtype=np.float32)
+    block = 4000  # 每批 4000 格 = 20 秒
+    for f0 in range(0, n_frames, block):
+        f1 = min(f0 + block, n_frames)
+        s0, s1 = f0 * hop, (f1 - 1) * hop + win
+        x = np.asarray(audio[max(s0 - 1, 0):s1], dtype=np.float32)
+        y = np.empty(s1 - s0, dtype=np.float32)
+        if s0 == 0:
+            y[0] = x[0]
+            y[1:] = x[1:] - PRE_EMPHASIS * x[:-1]
+        else:
+            y[:] = x[1:] - PRE_EMPHASIS * x[:-1]
+        frames = np.lib.stride_tricks.sliding_window_view(y, win)[::hop]
+        env[f0:f1] = 10.0 * np.log10(np.mean(frames * frames, axis=1) + 1e-10)
+    return env
+
+
+def _find_onset(env, i0: int, lo_i: int, fwd_i: int, thr: float, dip_n: int):
+    """
+    在能量序列 env 上找「聲音開始」的位置。i0 = CTC 給的位置；lo_i = 往前最多找到哪一格；
+    fwd_i = 往後最多找到哪一格。回傳 (第一格有聲音的位置, 種類)：
+        "edge"   找到明確的「靜音 → 有聲」，回傳的是有聲那一段的第一格
+        "cont"   i0 有聲音，但一路往前找到下限都沒有中斷（前面是連續的聲音，可能是上一個詞、背景音）→ 沒有證據
+        "silent" i0 沒有聲音，往後找也沒有 → CTC 說有字的地方聽不到聲音
+    終點也用同一個函式：把 env 前後反轉再呼叫，「開始」就變成「結束」。
+    """
+    if env[i0:i0 + 3].max() >= thr:
+        first, dips, j = i0, 0, i0 - 1
+        while j >= lo_i:
+            if env[j] >= thr:
+                first, dips = j, 0
+            else:
+                dips += 1
+                if dips >= dip_n:
+                    return first, "edge"
+            j -= 1
+        return (first, "edge") if dips else (first, "cont")  # dips > 0：下限前已經有一小段靜音
+    for j in range(i0 + 1, fwd_i + 1):  # CTC 位置還沒有聲音：往後找聲音真正開始的地方
+        if env[j] >= thr:
+            return j, "edge"
+    return i0, "silent"
+
+
+def _refine_one(env, s: float, e: float, lo_t, hi_t, c: dict, ref_level=None):
+    """
+    微調一個詞的起訖。lo_t / hi_t = 起點不能早於、終點不能晚於的時間（前一個詞的終點、下一個詞的起點；None = 沒有限制）。
+    ref_level = 整份音訊裡一般說話的音量（dB）：這個詞附近整片都比它安靜很多 → 那裡根本沒有人在說話（silent）。
+    """
+    hop, half = ENV_HOP_SEC, ENV_WIN_SEC / 2
+    n = len(env)
+
+    def idx(t):  # 中心點最接近時間 t 的那一格
+        return min(max(int(round((t - half) / hop)), 0), n - 1)
+
+    def tm(j):
+        return j * hop + half
+
+    bad = (s, e, ["noisy", None, "noisy", None])
+    if n == 0 or e <= s:
+        return bad
+    ctx = env[idx(s - c["ctx_sec"]): idx(e + c["ctx_sec"]) + 1]
+    level, floor = float(np.percentile(ctx, 95)), float(np.percentile(ctx, 10))
+    contrast = level - floor
+    if contrast < c["min_contrast_db"]:
+        if ref_level is not None and level < ref_level - c["quiet_db"]:  # 附近整片安靜，CTC 卻說這裡有字
+            return s, e, ["silent", None, "silent", None]
+        return bad
+    thr = max(floor + c["thr_frac"] * contrast, level - c["max_range_db"], floor + 6.0)
+    thr = min(thr, level - 3.0)
+    dip_n = max(1, int(round(c["dip_sec"] / hop)))
+
+    # ---- 起點 ----
+    lo_eff = s - c["back_sec"] if lo_t is None else min(max(lo_t, s - c["back_sec"]), s)
+    i_s = idx(s)
+    j, kind = _find_onset(env, i_s, min(idx(lo_eff), i_s), max(idx(min(s + c["fwd_sec"], e - MIN_UNIT_SEC)), i_s),
+                          thr, dip_n)
+    s2, s_status, s_delta = s, kind, None
+    if kind == "edge":
+        s2 = s if j == i_s else max(tm(j), lo_eff)
+        s_delta = s2 - s
+        s_status = "ok" if abs(s_delta) <= c["agree_sec"] else "moved"
+
+    # ---- 終點：把 env 前後反轉，用同一個函式找「聲音結束」----
+    hi_eff = e + c["end_fwd_sec"] if hi_t is None else max(min(hi_t, e + c["end_fwd_sec"]), e)
+    i_e = idx(e)
+    top = max(idx(hi_eff), i_e)
+    bottom = min(idx(max(e - c["end_back_sec"], s2 + MIN_UNIT_SEC)), i_e)
+    rev = env[bottom:top + 1][::-1]
+    j, kind = _find_onset(rev, top - i_e, 0, top - bottom, thr, dip_n)
+    e2, e_status, e_delta = e, kind, None
+    if kind == "edge":
+        e2 = e if top - j == i_e else min(tm(top - j), hi_eff)
+        e_delta = e2 - e
+        e_status = "ok" if abs(e_delta) <= c["agree_sec"] else "moved"
+
+    if e2 < s2 + MIN_UNIT_SEC:  # 兩邊各自合理、合起來卻不成立（極端情況）：整個放棄，維持 CTC 的時間
+        return bad
+    return s2, e2, [s_status, s_delta, e_status, e_delta]
+
+
+def refine_boundaries(env, times: list, cfg=None):
+    """
+    times = [(起點秒, 終點秒), ...]：照時間順序排好的詞。回傳 (微調後的 times, checks)，
+    checks[i] = [起點狀態, 起點修正秒數, 終點狀態, 終點修正秒數]，狀態見 STATUS_LABELS。
+    一個詞的邊界不會越過前一個詞（已微調過）的終點、以及下一個詞（CTC）的起點。
+    """
+    c = {**REFINE_DEFAULTS, **(cfg or {})}
+    ref_level = None
+    if len(env):
+        last = len(env) - 1
+        levels = [np.percentile(env[min(max(int(round((s - ENV_WIN_SEC / 2) / ENV_HOP_SEC)), 0), last):
+                                    min(max(int(round((e - ENV_WIN_SEC / 2) / ENV_HOP_SEC)), 0), last) + 1], 90)
+                  for s, e in times if e > s]
+        ref_level = float(np.median(levels)) if levels else None
+    out, checks = [], []
+    prev_end = None
+    for i, (s, e) in enumerate(times):
+        next_start = times[i + 1][0] if i + 1 < len(times) else None
+        s2, e2, check = _refine_one(env, s, e, prev_end, next_start, c, ref_level)
+        out.append((s2, e2))
+        checks.append(check)
+        prev_end = e2
+    return out, checks
+
+
+def summarize_checks(flat_checks: list) -> list[str]:
+    """把 checks 統計成幾行文字（給日誌）：一致率、修正量、無法判定的原因。"""
+    lines = []
+    for label, si in (("起點", 0), ("終點", 2)):
+        statuses = [c[si] for c in flat_checks]
+        count = {k: statuses.count(k) for k in STATUS_LABELS}
+        judged = count["ok"] + count["moved"] + count["silent"]
+        if not statuses:
+            continue
+        parts = []
+        if judged:
+            parts.append(f"一致 {count['ok']} 個（{100 * count['ok'] / judged:.0f}%）")
+            if count["moved"]:
+                deltas = np.array([c[si + 1] for c in flat_checks if c[si] == "moved"])
+                parts.append(f"依聲音修正 {count['moved']} 個（{100 * count['moved'] / judged:.0f}%，"
+                             f"中位數 {np.median(deltas):+.2f} 秒，最大 {deltas[np.abs(deltas).argmax()]:+.2f} 秒）")
+            if count["silent"]:
+                parts.append(f"該處聽不到聲音 {count['silent']} 個")
+        skipped = [f"{STATUS_LABELS[k]} {count[k]}" for k in ("cont", "noisy") if count[k]]
+        if skipped:
+            parts.append("無法判定：" + "、".join(skipped))
+        lines.append(f"{label}：" + "；".join(parts))
+    return lines
+
+
+# =========================================================
 # === 主流程 ===
 # =========================================================
 class Aligner:
@@ -208,6 +409,12 @@ class Aligner:
         if not candidates:  # 字表很怪、全被排除時退回只排除 blank
             candidates = [v for v in sorted(set(self.vocab.values())) if v != self.blank_id]
         self.star_candidates = np.array(candidates)
+        # 每個 frame 對應幾個取樣點（wav2vec2 是 320 = 0.02 秒）。取不到時 log_probs 會退回用視窗長度估
+        stride = getattr(getattr(self.model, "config", None), "conv_stride", None)
+        try:
+            self.frame_stride = int(np.prod(stride)) if stride else None
+        except (TypeError, ValueError):
+            self.frame_stride = None
 
     def park(self) -> None:
         """工作做完：把模型搬到 CPU、釋放顯存。常駐等下一個檔案的期間，GPU 留給 Whisper／Demucs。"""
@@ -220,18 +427,30 @@ class Aligner:
         if self.device.startswith("cuda"):
             self.model.to(self.device)
 
-    def log_probs(self, chunk: np.ndarray, sr: int):
-        """對一段音訊跑 wav2vec2，回傳 (log 機率含萬用字元欄, 每 frame 秒數)。"""
+    def _posteriors(self, chunk: np.ndarray, sr: int) -> np.ndarray:
+        """跑模型，回傳每個 frame 對每個字的 log 機率 (T, 字表大小)。"""
         torch = self.torch
         inputs = self.processor(chunk, sampling_rate=sr, return_tensors="pt")
         with torch.inference_mode():
             logits = self.model(inputs.input_values.to(self.device)).logits[0]
-        lp = torch.log_softmax(logits.float(), dim=-1).cpu().numpy()
+        return torch.log_softmax(logits.float(), dim=-1).cpu().numpy()
+
+    def log_probs(self, chunk: np.ndarray, sr: int):
+        """
+        對一段音訊跑 wav2vec2，回傳 (log 機率含萬用字元欄, 每 frame 秒數)。
+        第 t 個 frame 一定是從 t * 步幅 個取樣點開始（wav2vec2 是 320 個 = 0.02 秒）。
+        以前用「視窗秒數 / frame 數」估每格多久：因為最後一個不足一格的尾巴（加上 400 取樣的感受野）
+        會被平均分給每一格，每格多估了一點點，越靠近視窗尾端越晚，最多晚一整格（20 毫秒）。
+        """
+        lp = self._posteriors(chunk, sr)
         if lp.shape[1] <= self.star_id:  # 模型輸出欄數跟字表不一致時補齊
             lp = np.pad(lp, ((0, 0), (0, self.star_id - lp.shape[1])), constant_values=-np.inf)
         star = lp[:, self.star_candidates[self.star_candidates < lp.shape[1]]].max(axis=1, keepdims=True) - STAR_PENALTY
         lp = np.concatenate([lp[:, :self.star_id], star], axis=1)
-        return lp, (len(chunk) / sr) / lp.shape[0]
+        frame_sec = (len(chunk) / sr) / lp.shape[0]  # 估的：模型步幅不明、或跟實際 frame 數對不上時才用
+        if self.frame_stride and abs(len(chunk) / self.frame_stride - lp.shape[0]) <= 3:
+            frame_sec = self.frame_stride / sr
+        return lp, frame_sec
 
 
 def align_job(aligner: Aligner, job: dict) -> dict:
@@ -427,6 +646,30 @@ def align_job(aligner: Aligner, job: dict) -> dict:
         emit("LOG", f"第二輪：{sum(used_wide)} 條採用擴大範圍的結果"
              + (f"，{n_stretched} 條因為句子被拉長而保留第一輪結果" if n_stretched else ""))
 
+    # ---------- 用聲音能量微調每個詞的起訖，並交叉驗證（說明見上面「用聲音能量微調邊界」）----------
+    checks = [None] * n
+    refine_cfg = p.get("refine")
+    if refine_cfg and refine_cfg.get("enabled"):
+        units = []  # (句子編號, 第幾個詞, 詞的第一個 token, 詞的最後一個 token + 1)，照時間順序
+        for k in range(n):
+            if spans[k] is None or tok_times[k] is None:
+                continue
+            tok_times[k] = [list(t) for t in tok_times[k]]
+            checks[k] = [None] * len(seg_word_ranges[k])
+            units.extend((k, wi, a, b) for wi, (a, b) in enumerate(seg_word_ranges[k]) if b > a)
+        if units:
+            env = energy_envelope_db(audio, sr)
+            new_times, unit_checks = refine_boundaries(
+                env, [(tok_times[k][a][0], tok_times[k][b - 1][1]) for k, _, a, b in units], refine_cfg)
+            for (k, wi, a, b), (s, e), check in zip(units, new_times, unit_checks):
+                tok_times[k][a][0], tok_times[k][b - 1][1] = s, e
+                checks[k][wi] = check
+            for k in {u[0] for u in units}:
+                spans[k] = [tok_times[k][0][0], tok_times[k][-1][1]]
+            emit("LOG", f"[對齊驗證] 用聲音能量檢查 {len(units)} 個詞的起訖（CTC 對齊 vs 聲音開始／結束的位置）：")
+            for line in summarize_checks(unit_checks):
+                emit("LOG", "    " + line)
+
     # 每個詞的時間：詞的第一個字的起點 → 最後一個字的終點；詞裡沒有會發音的字（純標點）→ null
     word_spans = []
     for k in range(n):
@@ -439,7 +682,7 @@ def align_job(aligner: Aligner, job: dict) -> dict:
 
     emit("PROGRESS", "1000 1000")
     aligner.jobs_done += 1
-    return {"spans": spans, "confs": confs, "wide": used_wide, "word_spans": word_spans}
+    return {"spans": spans, "confs": confs, "wide": used_wide, "word_spans": word_spans, "checks": checks}
 
 
 def run_once(job_path: str, result_path: str) -> None:

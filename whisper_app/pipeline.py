@@ -61,7 +61,8 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
     report_alignment(segments, subs, log_func)
 
     JOBS.check()
-    output_path = os.path.join(runtime.output_dir, f"{srt_path.stem}_align.srt")
+    align_tag = "_align" if config.ALIGN_REFINE else "_align_ctc"  # 關掉聲音微調的版本不會蓋掉微調版，方便比較
+    output_path = os.path.join(runtime.output_dir, f"{srt_path.stem}{align_tag}.srt")
     write_srt(output_path, subs)
     progress_func(1.0)
     log_func(f"=== 完成，對齊後字幕已儲存：{output_path} ===\n")
@@ -177,7 +178,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     if align_result is not None:
         report_alignment(raw, subs, log_func)  # 插完空白字幕再列，編號才跟 SRT 一致
 
-    align_tag = "_align" if align_result is not None else ""
+    align_tag = ("_align" if config.ALIGN_REFINE else "_align_ctc") if align_result is not None else ""
     JOBS.check()
     split_tag = "" if use_split else "_nosplit"  # 有沒有拆分的版本不會互相覆蓋
     output_filename = f"{base}_{config.WHISPER_MODEL}_{sep_tag}{align_tag}{split_tag}.srt"

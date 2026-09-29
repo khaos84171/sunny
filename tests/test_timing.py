@@ -111,6 +111,21 @@ def test_apply_alignment_without_word_times_rescales_whisper_words():
     assert (words[0].start, words[0].end, words[1].end) == (10.0, 11.0, 12.0)
 
 
+def test_apply_alignment_keeps_the_sound_check_of_each_word():
+    segs = [make_segment(), make_segment()]
+    checks = [[["moved", -0.06, "ok", 0.01], ["ok", 0.0, "moved", 0.09]], None]
+    result = {"spans": [[1.0, 2.0], [3.0, 4.0]], "confs": [0.8, 0.8], "wide": [False, False],
+              "word_spans": [[[1.0, 1.5], [1.5, 2.0]], [[3.0, 3.5], [3.5, 4.0]]], "checks": checks}
+    timing.apply_alignment(segs, result, lambda m: None)
+    assert segs[0]["checks"] == checks[0] and segs[1]["checks"] is None
+
+
+def test_apply_alignment_accepts_a_result_from_an_old_worker_without_checks():
+    segs = [make_segment()]
+    timing.apply_alignment(segs, {"spans": [[1.2, 2.6]], "confs": [0.8], "wide": [False], "word_spans": [None]}, lambda m: None)
+    assert segs[0]["checks"] is None and segs[0]["aligned"] is True
+
+
 # ---------------- report_alignment ----------------
 def test_report_lists_unaligned_low_confidence_and_big_shifts(monkeypatch):
     segs = [
@@ -128,6 +143,37 @@ def test_report_lists_unaligned_low_confidence_and_big_shifts(monkeypatch):
     assert "3 處" in text
     assert "#3" in text and "對不上" in text and "#4" in text and "信心 0.10" in text and "#5" in text and "大範圍重對" in text
     assert "ok" not in text.replace("okay", "")
+
+
+def test_report_lists_words_placed_where_there_is_no_sound(monkeypatch):
+    """聲音交叉檢查：CTC 說有字、該處卻聽不到聲音（Whisper 幻覺或對到錯的地方）→ 列出是哪個詞。"""
+    fine = ["ok", 0.0, "ok", 0.0]
+    segs = [
+        {"start": 0, "end": 1, "text": "正常", "conf": 0.9, "aligned": True, "orig_start": 0.0, "checks": [fine],
+         "words": [Word(0, 1, "正常")]},
+        {"start": 2, "end": 4, "text": "今日は誰もいない", "conf": 0.9, "aligned": True, "orig_start": 2.0,
+         "checks": [fine, ["silent", None, "silent", None]], "words": [Word(2, 3, "今日は"), Word(3, 4, "誰もいない")]},
+        {"start": 5, "end": 6, "text": "分不出來", "conf": 0.9, "aligned": True, "orig_start": 5.0,
+         "checks": [["noisy", None, "noisy", None]], "words": [Word(5, 6, "分不出來")]},      # 無法判定不算有問題
+        {"start": 7, "end": 8, "text": "沒有詞時間", "conf": 0.9, "aligned": True, "orig_start": 7.0,
+         "checks": [["ok", 0.0, "silent", None]]},                                            # 沒有 words 時用整句
+    ]
+    subs = [{"src": i, "start": s["start"], "end": s["end"], "text": s["text"]} for i, s in enumerate(segs)]
+    logs = []
+    timing.report_alignment(segs, subs, logs.append)
+    text = "\n".join(logs)
+    assert "2 處" in text
+    assert "#2" in text and "「誰もいない」的位置聽不到聲音" in text
+    assert "#4" in text and "「沒有詞時間」的位置聽不到聲音" in text
+    assert "#1" not in text and "#3" not in text
+
+
+def test_report_prefers_the_more_serious_reason_when_several_apply():
+    seg = {"start": 2, "end": 3, "text": "信心低又聽不到", "conf": 0.1, "aligned": True, "orig_start": 2.0,
+           "checks": [["silent", None, "silent", None]], "words": [Word(2, 3, "信心低又聽不到")]}
+    logs = []
+    timing.report_alignment([seg], [{"src": 0, "start": 2, "end": 3, "text": "x"}], logs.append)
+    assert len(logs) == 2 and "信心 0.10" in logs[1] and "聽不到聲音" not in logs[1]
 
 
 def test_report_is_silent_when_everything_is_fine():

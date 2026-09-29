@@ -13,12 +13,14 @@ def apply_alignment(segments: list[dict], result: dict, log_func):
     對不上的片段保留原本時間。另外記下 orig_start / conf / wide / aligned 給檢查報告用。
     """
     shifts = []
-    for seg, span, conf, wide, wspans in zip(segments, result["spans"], result["confs"],
-                                             result["wide"], result["word_spans"]):
+    checks = result.get("checks") or [None] * len(segments)  # 舊版 align_worker.py 沒有
+    for seg, span, conf, wide, wspans, check in zip(segments, result["spans"], result["confs"],
+                                                    result["wide"], result["word_spans"], checks):
         seg["orig_start"] = seg["start"]
         seg["conf"] = conf
         seg["wide"] = bool(wide)
         seg["aligned"] = span is not None
+        seg["checks"] = check
         if span is None:
             continue
         shifts.append(abs(span[0] - seg["start"]))
@@ -60,6 +62,16 @@ def report_alignment(segments: list[dict], subs: list[dict], log_func):
         if sub.get("src") is not None:
             numbers.setdefault(sub["src"], []).append(no)
 
+    def silent_word(seg) -> str | None:
+        """聲音交叉檢查：CTC 說有字、該處卻聽不到聲音的第一個詞（可能是幻覺、聽錯，或對到錯的地方）。"""
+        words, checks = seg.get("words"), seg.get("checks")
+        if not checks:
+            return None
+        for i, check in enumerate(checks):
+            if check and "silent" in (check[0], check[2]):
+                return words[i].word.strip() if words and i < len(words) else seg["text"]
+        return None
+
     suspicious = []
     for i, seg in enumerate(segments):
         if not seg["text"].strip():
@@ -72,6 +84,8 @@ def report_alignment(segments: list[dict], subs: list[dict], log_func):
         elif abs(seg["start"] - seg["orig_start"]) >= config.ALIGN_BIG_SHIFT_SEC:
             why = (f"起點移動 {seg['start'] - seg['orig_start']:+.1f} 秒"
                    + ("，大範圍重對" if seg.get("wide") else ""))
+        elif (word := silent_word(seg)) is not None:
+            why = f"「{word}」的位置聽不到聲音"
         else:
             continue
         nos = numbers.get(i, [i + 1])

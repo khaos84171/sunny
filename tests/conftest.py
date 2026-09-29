@@ -42,6 +42,20 @@ def isolated(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def worker_module(monkeypatch):
+    """在同一個程序裡載入 align_worker（用假的 torch/transformers）。"""
+    import importlib
+    monkeypatch.syspath_prepend(str(TESTS / "ml_stubs"))
+    monkeypatch.syspath_prepend(str(ROOT))
+    for name in ("align_worker", "torch", "transformers"):
+        sys.modules.pop(name, None)
+    module = importlib.import_module("align_worker")
+    yield module
+    for name in ("align_worker", "torch", "transformers"):
+        sys.modules.pop(name, None)
+
+
+@pytest.fixture
 def fake_demucs(monkeypatch):
     """讓 Demucs 指令找得到 tests/fakes 裡的假 demucs（同一個 Python 的 -m demucs.separate）。"""
     fakes = str(TESTS / "fakes")

@@ -99,7 +99,7 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
     """
     呼叫 align_worker.py 用 wav2vec2 強制對齊。
     segments: [{"start", "end", "text", "words"(可省略，list[Word])}, ...]
-    回傳 {"duration", "spans", "confs", "wide", "word_spans"}，每個 list 都跟 segments 一樣長；
+    回傳 {"duration", "spans", "confs", "wide", "word_spans", "checks"}，每個 list 都跟 segments 一樣長；
     個別片段對不上時該項是 None，不會整份失敗。
     """
     if not config.ALIGN_WORKER.exists():
@@ -137,6 +137,17 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
                 "batch_sec": config.ALIGN_BATCH_SEC,
                 "low_conf": config.ALIGN_LOW_CONF,
                 "max_inner_gap": config.ALIGN_MAX_INNER_GAP,
+                # 舊版 align_worker.py 不認得這一項就會略過（等於只用 CTC）
+                "refine": {
+                    "enabled": bool(config.ALIGN_REFINE),
+                    "back_sec": config.ALIGN_REFINE_BACK_SEC,
+                    "fwd_sec": config.ALIGN_REFINE_FWD_SEC,
+                    "end_fwd_sec": config.ALIGN_REFINE_END_FWD_SEC,
+                    "end_back_sec": config.ALIGN_REFINE_END_BACK_SEC,
+                    "min_contrast_db": config.ALIGN_REFINE_MIN_CONTRAST_DB,
+                    "thr_frac": config.ALIGN_REFINE_THRESHOLD,
+                    "agree_sec": config.ALIGN_AGREE_SEC,
+                },
             },
         }, ensure_ascii=False), encoding="utf-8")
 
@@ -160,4 +171,6 @@ def run_alignment(audio_path: str, segments: list[dict], log_func, progress_func
         "wide": result.get("wide") or [False] * n,
         # 舊版 align_worker.py 沒有這一項：拆分會退回用 Whisper 的詞時間
         "word_spans": result.get("word_spans") or [None] * n,
+        # 每個詞的聲音交叉檢查 [起點狀態, 起點修正秒數, 終點狀態, 終點修正秒數]；舊版 align_worker.py 沒有
+        "checks": result.get("checks") or [None] * n,
     }
