@@ -1,6 +1,7 @@
 """介面：設定記憶、Hotwords 預設、日誌視窗、取消／佇列、拖放、錯誤回報、關閉視窗、DPI。
 需要真的 tkinter 和顯示器；沒有的話整個檔案會跳過（Linux 可以用 xvfb-run -a python -m pytest）。"""
 import json
+import threading
 import time
 import types
 from pathlib import Path
@@ -10,7 +11,7 @@ import pytest
 tkinter = pytest.importorskip("tkinter")
 
 from helpers import wait_for                                                              # noqa: E402
-from whisper_app import config, gui, runtime                                              # noqa: E402
+from whisper_app import config, gui, pipeline, runtime                                    # noqa: E402
 from whisper_app.jobs import JOBS                                                         # noqa: E402
 
 NAMES, COMMON = config.HOTWORD_NAME_CANDIDATES, config.HOTWORD_COMMON_CANDIDATES
@@ -316,6 +317,51 @@ def test_cancel_button_is_on_the_window_and_wired_to_cancel_all(make_app, monkey
     assert button is not None
     button.invoke()
     assert pressed == [app]
+
+
+def test_cancel_button_is_at_the_top_and_stays_visible_when_the_window_is_shrunk(make_app):
+    """按鈕在最上方的橫幅，不在會被擠掉的狀態列：視窗縮到最小、狀態文字又很長，也要完整看得到。"""
+    app = make_app()
+    root, button = app.root, app.cancel_button
+    spin(root)
+    assert button.winfo_rooty() + button.winfo_height() <= app.log_box.winfo_rooty()         # 在日誌面板上方（橫幅裡）
+    app.status_var.set(" 處理中：QuizKnock 東大生が本気で挑む超難問クイズ大会 完全版 第12回 ノーカット.mp4")
+    min_w, min_h = root.minsize()
+    for w, h in ((min_w, min_h), (min_w + 150, min_h), (min_w, min_h + 200)):
+        root.geometry(f"{w}x{h}")
+        spin(root, 0.3)
+        left, top = button.winfo_rootx() - root.winfo_rootx(), button.winfo_rooty() - root.winfo_rooty()
+        assert button.winfo_ismapped() and button.winfo_width() > 20, (w, h)
+        assert 0 <= left and left + button.winfo_width() <= root.winfo_width(), (w, h)
+        assert 0 <= top and top + button.winfo_height() <= root.winfo_height() // 3, (w, h)
+
+
+def test_cancel_returns_quickly_even_when_whisper_is_stuck_decoding(make_app, monkeypatch, tmp_path):
+    """Whisper 在主程式裡解碼一個視窗要好幾秒、殺不掉：畫面不能停在「正在取消…」等它，程式也要能接著處理下一個。"""
+    release, started = threading.Event(), threading.Event()
+
+    class StuckModel:
+        def transcribe(self, path, **kw):
+            def gen():
+                started.set()
+                release.wait(10)                               # 解碼一個視窗
+                yield types.SimpleNamespace(start=0, end=5, text="こんにちは", words=None, no_speech_prob=0.0, avg_logprob=-0.3)
+            return gen(), types.SimpleNamespace(duration=60.0, duration_after_vad=50.0)
+    monkeypatch.setattr(pipeline, "get_model", lambda log: StuckModel())
+    app = make_app()
+    app.use_sep_var.set(False)
+    app.use_align_var.set(False)
+    app._handle_dropped([touch(tmp_path / "a.mp4")])
+    assert wait_for(started.is_set)
+    t0 = time.time()
+    app.cancel_all()
+    try:
+        assert wait_for(lambda: app._pending == 0, 3) and time.time() - t0 < 2
+    finally:
+        release.set()
+    spin(app.root, 0.4)                                        # 讓佇列裡的狀態與日誌顯示出來
+    assert app.status_var.get().strip() == "已取消" and "已取消：a.mp4" in window_text(app)
+    assert not list(Path(runtime.output_dir).glob("*.srt"))
 
 
 # ================= 錯誤回報 =================

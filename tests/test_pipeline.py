@@ -1,4 +1,6 @@
 """完整處理流程：轉錄 → 幻覺過濾 → 對齊 → 拆分 → 輸出 SRT；進度條分配；輸出檔名；取消。"""
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -195,3 +197,41 @@ def test_cancellation_is_not_swallowed_as_an_alignment_failure(stub, monkeypatch
     monkeypatch.setattr(pipeline, "run_alignment", cancelled)
     with pytest.raises(JobCancelled):
         stub.run(use_align=True)
+
+
+@pytest.mark.parametrize("stuck_at", ["載入模型", "解碼音訊與 VAD", "解碼一個視窗"])
+def test_cancel_does_not_wait_for_whisper_wherever_it_is_stuck(stub, monkeypatch, stuck_at):
+    """Whisper 在主程式裡跑、殺不掉：卡在哪一步，按取消都要馬上停下來，之後也不能再寫日誌或輸出檔案。"""
+    release = threading.Event()
+    info = types.SimpleNamespace(duration=100.0, duration_after_vad=90.0)
+
+    class StuckModel(FakeModel):
+        def transcribe(self, path, **kw):
+            if stuck_at == "解碼音訊與 VAD":
+                release.wait(10)
+
+            def gen():
+                yield Seg(0, 10, "こんにちは")
+                if stuck_at == "解碼一個視窗":
+                    release.wait(10)
+                yield Seg(10, 20, "もう一句")
+            return gen(), info
+
+    def get_model(log):
+        if stuck_at == "載入模型":
+            release.wait(10)
+        return StuckModel()
+    monkeypatch.setattr(pipeline, "get_model", get_model)
+    logs = []
+    JOBS.begin(JOBS.generation)
+    threading.Timer(0.3, JOBS.cancel).start()
+    t0 = time.time()
+    try:
+        with pytest.raises(JobCancelled):
+            pipeline.process_file("/x/影片.mp4", False, False, True, [], logs.append, lambda f: None, add_blank=False)
+        assert time.time() - t0 < 2                        # 沒有等到 release：不必等 Whisper 做完
+    finally:
+        release.set()
+    time.sleep(0.3)                                        # 讓背景那邊做完，確認它不會再影響到已取消的這個檔案
+    assert not any("もう一句" in x for x in logs)
+    assert not list(Path(runtime.output_dir).glob("*.srt"))

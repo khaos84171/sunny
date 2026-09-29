@@ -276,3 +276,18 @@ def test_worker_reporting_failure_gives_code_and_message(server, fake_worker):
     with pytest.raises(RuntimeError, match="代碼 2") as e:
         server.run(one("fail"))
     assert "boom" in str(e.value)
+
+
+def test_cancel_does_not_wait_for_the_audio_to_be_decoded(monkeypatch):
+    """長影片解碼音訊要好幾秒，而且是在主程式裡跑、殺不掉：按取消不能等它。"""
+    release = threading.Event()
+    monkeypatch.setattr(aligner, "decode_audio", lambda path, sampling_rate=16000: (release.wait(10), AUDIO)[1])
+    JOBS.begin(JOBS.generation)
+    threading.Timer(0.3, JOBS.cancel).start()
+    t0 = time.time()
+    try:
+        with pytest.raises(JobCancelled):
+            aligner.run_alignment("/x/a.wav", SEGMENTS, lambda m: None, lambda f: None)
+        assert time.time() - t0 < 2 and aligner.ALIGN_SERVER._proc is None       # 沒等到解碼做完，也沒有白白啟動對齊程序
+    finally:
+        release.set()

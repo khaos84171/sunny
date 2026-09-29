@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import unicodedata
 
 from faster_whisper import WhisperModel
@@ -12,19 +13,21 @@ from .devices import resolve_device
 
 # === 模型快取：第一次轉錄時載入，之後一直重用 ===
 _loaded_model = None
+_model_lock = threading.Lock()   # 載入到一半被取消時，載入還會在背景跑完；下一個檔案要等它，不能再載一份（顯存會加倍）
 
 
 def get_model(log_func) -> WhisperModel:
     global _loaded_model
-    if _loaded_model is None:
-        device = resolve_device(config.WHISPER_DEVICE)
-        compute_type = config.WHISPER_COMPUTE_TYPE if device.startswith("cuda") else config.WHISPER_CPU_COMPUTE_TYPE
-        if device == "cpu" and config.WHISPER_DEVICE == "auto":
-            log_func(f"偵測不到可用的 NVIDIA GPU，Whisper 改用 CPU（{compute_type}），速度會慢很多")
-        log_func(f"載入模型中：{config.WHISPER_MODEL}（{device}／{compute_type}）…（只有第一次會比較久）")
-        _loaded_model = WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute_type)
-        log_func("模型載入完成。")
-    return _loaded_model
+    with _model_lock:
+        if _loaded_model is None:
+            device = resolve_device(config.WHISPER_DEVICE)
+            compute_type = config.WHISPER_COMPUTE_TYPE if device.startswith("cuda") else config.WHISPER_CPU_COMPUTE_TYPE
+            if device == "cpu" and config.WHISPER_DEVICE == "auto":
+                log_func(f"偵測不到可用的 NVIDIA GPU，Whisper 改用 CPU（{compute_type}），速度會慢很多")
+            log_func(f"載入模型中：{config.WHISPER_MODEL}（{device}／{compute_type}）…（只有第一次會比較久）")
+            _loaded_model = WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute_type)
+            log_func("模型載入完成。")
+        return _loaded_model
 
 
 def _phrase_key(text: str) -> str:
