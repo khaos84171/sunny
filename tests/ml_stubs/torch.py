@@ -56,3 +56,11 @@ def inference_mode():
 def log_softmax(t, dim=-1):
     a = t.a - t.a.max(axis=dim, keepdims=True)
     return _T(a - np.log(np.exp(a).sum(axis=dim, keepdims=True)))
+
+
+bfloat16 = "bfloat16"
+float32 = "float32"
+
+
+def device(name):
+    return name

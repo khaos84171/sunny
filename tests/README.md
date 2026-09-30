@@ -31,6 +31,8 @@ python -m pytest tests
 | `test_align_refine.py` | 用聲音能量微調邊界 + 交叉驗證：用合成音訊（真正的起訖已知）驗證邊界貼回去、背景太吵／連續語音時不亂動、不越過鄰居、聽不到聲音的詞會被點名 |
 | `test_accuracy_e2e.py` | 端到端：合成音訊 → 真的 worker 子程序（假模型照劇本放帶偏差的 CTC 尖峰）→ SRT → 跟標準答案比誤差，比較「只用 CTC」與「聲音微調」 |
 | `test_evaluate.py` | 評估工具 `python -m whisper_app.evaluate`：配對、誤差統計、K 折交叉驗證、建議設定值、命令列 |
+| `test_crosscheck.py` | 多模型交叉比對的投票規則：兩個模型一致才改、開頭結尾不增刪、語助詞／同音異字／漢字與假名／hotwords 不改、差太多只列出來；修改套用到詞（時間不變）；日誌與「其他模型都聽不到」的處理 |
+| `test_cross_asr.py` | 交叉比對的模型呼叫：真的 `asr_worker.py` 子程序配假的 `qwen_asr`／`nemo`（`ml_stubs/`，照劇本回答），程序重用、顯存搬移、提示詞、某個模型沒裝時不影響其他的；`process_file` 裡的修正、檔名、進度與失敗時照常輸出 |
 | `test_aligner.py` | 主程式這一側的對齊程序管理（重用、逾時、取消、出錯、重試） |
 | `test_runtime.py` | log 輪替、輸出資料夾與備用位置、啟動失敗的訊息框 |
 | `test_gui.py` | 設定記憶、Hotwords 預設、日誌視窗、取消／佇列／拖放、錯誤回報、關閉視窗、DPI |

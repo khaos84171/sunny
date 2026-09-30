@@ -191,7 +191,7 @@ class App:
         self._build_hotwords(controls.body)
         self._build_log_panel(body)
         for var in [self.use_sep_var, self.use_align_var, self.use_split_var, self.add_blank_var,
-                    *self.hotword_vars.values()]:
+                    self.use_cross_var, *self.hotword_vars.values()]:
             var.trace_add("write", self._on_setting_changed)  # 建好之後才掛，建立時的預設值不算「改動」
 
         # --- 背景處理：佇列 + 工作執行緒 ---
@@ -233,8 +233,11 @@ class App:
         self.use_align_var = tk.BooleanVar(value=bool(self._settings.get("use_align", True)))
         self.use_split_var = tk.BooleanVar(value=bool(self._settings.get("use_split", True)))
         self.add_blank_var = tk.BooleanVar(value=bool(self._settings.get("add_blank", True)))
+        # 要另外安裝 Qwen3-ASR／NeMo，而且比較慢，預設不勾
+        self.use_cross_var = tk.BooleanVar(value=bool(self._settings.get("use_cross", False)))
         for var, text in [
             (self.use_sep_var, "先用 Demucs 分離人聲"),
+            (self.use_cross_var, "用 Qwen3-ASR＋Parakeet 交叉比對，修正聽錯的字"),
             (self.use_align_var, "用 wav2vec2 強制對齊，校正時間戳"),
             (self.use_split_var, "自動拆分塞了好幾句的字幕"),
             (self.add_blank_var, "開頭加一條空白字幕（方便剪輯軟體對軸）"),
@@ -528,6 +531,7 @@ class App:
             "version": 1,
             "use_sep": self.use_sep_var.get(), "use_align": self.use_align_var.get(),
             "use_split": self.use_split_var.get(), "add_blank": self.add_blank_var.get(),
+            "use_cross": self.use_cross_var.get(),
             "hotwords": {word: var.get() for word, var in self.hotword_vars.items()},
         }
         if not save_settings(data) and not self._save_failed:
@@ -583,6 +587,7 @@ class App:
         # 沒有 .srt → 原本的轉錄流程
         use_align = self.use_align_var.get()
         use_split = self.use_split_var.get()
+        use_cross = self.use_cross_var.get()
         selected_hotwords = [w for w, var in self.hotword_vars.items() if var.get()]
         if len(media_files) > config.MANY_FILES_CONFIRM and not messagebox.askyesno(
                 "Whisper 字幕產生器", f"這次要加入 {len(media_files)} 個檔案，全部都處理嗎？", parent=self.root):
@@ -592,6 +597,7 @@ class App:
             self._enqueue({
                 "kind": "transcribe", "path": p, "use_sep": use_sep, "use_align": use_align,
                 "use_split": use_split, "hotwords": selected_hotwords, "add_blank": add_blank,
+                "use_cross": use_cross,
             })
         self.log(f">>> 已加入佇列：{len(media_files)} 個檔案"
                  f"（hotwords：{'、'.join(selected_hotwords) if selected_hotwords else '無'}）")
@@ -632,7 +638,7 @@ class App:
                     process_file(job["path"], job["use_sep"], job["use_align"],
                                  job["use_split"], job["hotwords"],
                                  self.log, self.set_progress,
-                                 add_blank=job["add_blank"])
+                                 add_blank=job["add_blank"], use_cross=job.get("use_cross", False))
                 self.set_status("完成，等待下一個檔案…")
             except JobCancelled:
                 self.log(f">>> 已取消：{name}")

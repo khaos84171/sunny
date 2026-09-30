@@ -1,4 +1,4 @@
-"""處理單一檔案的完整流程:（可選）人聲分離 → 轉錄 →（可選）對齊 → 拆分 → 輸出 SRT；以及只對齊現有 SRT。"""
+"""處理單一檔案的完整流程:（可選）人聲分離 → 轉錄 →（可選）交叉比對 →（可選）對齊 → 拆分 → 輸出 SRT；以及只對齊現有 SRT。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from pathlib import Path
 
 from . import config, runtime
 from .aligner import run_alignment
+from .cross_asr import backend_label, run_cross_asr
+from .crosscheck import apply_crosscheck
 from .jobs import JOBS, JobCancelled
 from .models import Word
 from .separation import separate_vocals
@@ -71,8 +73,8 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
 
 def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool,
                   hotword_list: list[str],
-                  log_func, progress_func, add_blank: bool = True) -> str:
-    """處理單一檔案：（可選）人聲分離 -> 轉錄 ->（可選）時間戳對齊 -> 輸出 SRT，回傳輸出檔案路徑。"""
+                  log_func, progress_func, add_blank: bool = True, use_cross: bool = False) -> str:
+    """處理單一檔案：（可選）人聲分離 -> 轉錄 ->（可選）交叉比對 ->（可選）時間戳對齊 -> 輸出 SRT，回傳輸出檔案路徑。"""
     input_path = Path(file_path)
     base = input_path.stem  # 用原始檔名作為輸出檔名的基礎，取代固定的 "abc"
 
@@ -82,6 +84,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     log_func(
         f"設定：模型 = {config.WHISPER_MODEL}、人聲分離 = {'是' if use_sep else '否'}、"
         f"時間戳對齊 = {'是' if use_align else '否'}、自動拆分 = {'是' if use_split else '否'}"
+        + (f"、交叉比對 = {'＋'.join(backend_label(n) for n in config.CROSS_MODELS)}" if use_cross else "")
     )
 
     # 有做人聲分離時，分離佔進度條的前一段，轉錄與對齊縮進剩下的部分
@@ -116,8 +119,10 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     log_func(f"音訊總長度: {info.duration:.2f} 秒")
     log_func(f"VAD 後語音長度: {info.duration_after_vad:.2f} 秒")
 
-    # 要做對齊時，轉錄佔進度條前 80%，對齊佔後 20%
-    transcribe_weight = 0.8 if use_align else 1.0
+    # 要做對齊時，對齊佔進度條最後 20%；交叉比對佔它前面的 CROSS_PROGRESS_SHARE；剩下的都是轉錄
+    align_weight = 0.2 if use_align else 0.0
+    cross_weight = config.CROSS_PROGRESS_SHARE if use_cross else 0.0
+    transcribe_weight = 1.0 - align_weight - cross_weight
     total = max(info.duration, 0.01)
     raw = []  # Whisper 原本的片段（還沒拆）
     for segment in segments:
@@ -135,6 +140,28 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         log_func(f"[{format_timestamp(segment.start)} --> {format_timestamp(segment.end)}] {text}")
         progress_func(min(segment.end / total, 1.0) * transcribe_weight)
 
+    # 交叉比對：另外兩個模型再聽一次，多數決修正 Whisper 聽錯的字（要在對齊之前做，對齊才會用修正後的文字）
+    cross_used = False
+    if use_cross and raw:
+        try:
+            hyps, used = run_cross_asr(
+                transcribe_input, raw, hotword_list, log_func,
+                lambda frac: progress_func(transcribe_weight + cross_weight * frac),
+            )
+        except JobCancelled:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            log_func(f"!!! [交叉比對] 失敗：{e}（這次先輸出 Whisper 原本的文字）")
+        else:
+            if used:
+                if len(used) < config.CROSS_MIN_VOTES:
+                    log_func(f"[交叉比對] 只有 {len(used)} 個模型可以用，這次只列出差異、不自動修正"
+                             f"（至少要 {config.CROSS_MIN_VOTES} 個模型寫法一致才改）")
+                apply_crosscheck(raw, hyps, {n: backend_label(n) for n in used}, log_func, protect=hotword_list)
+                cross_used = len(used) >= config.CROSS_MIN_VOTES
+        JOBS.check()
+
     # 先對齊 Whisper 原本的整段（文字長對得穩），順便拿到每個詞的精確時間
     align_result = None
     if use_align and raw:
@@ -142,7 +169,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         try:
             align_result = run_alignment(
                 transcribe_input, raw, log_func,
-                lambda frac: progress_func(transcribe_weight + (1 - transcribe_weight) * frac),
+                lambda frac: progress_func(transcribe_weight + cross_weight + align_weight * frac),
             )
         except JobCancelled:
             raise
@@ -181,7 +208,8 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     align_tag = ("_align" if config.ALIGN_REFINE else "_align_ctc") if align_result is not None else ""
     JOBS.check()
     split_tag = "" if use_split else "_nosplit"  # 有沒有拆分的版本不會互相覆蓋
-    output_filename = f"{base}_{config.WHISPER_MODEL}_{sep_tag}{align_tag}{split_tag}.srt"
+    cross_tag = "_cross" if cross_used else ""    # 有交叉比對修正的版本也不會蓋掉只用 Whisper 的
+    output_filename = f"{base}_{config.WHISPER_MODEL}_{sep_tag}{cross_tag}{align_tag}{split_tag}.srt"
     output_path = os.path.join(runtime.output_dir, output_filename)
     write_srt(output_path, subs)
 

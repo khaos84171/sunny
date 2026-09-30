@@ -65,6 +65,16 @@ Whisper 字幕產生器（拖放視窗版／可雙擊啟動）
        第一次開啟時「人名」都不勾、「通用詞」預設勾選（人名每部影片不同，不相關的反而會干擾辨識）。
        whisper_app.log 超過 2 MB 會換檔（只留最近 3 份舊的），日誌視窗最多留 LOG_MAX_LINES 行，
        往上捲動看舊訊息時不會被新訊息拉回底部。螢幕縮放大於 100% 時視窗不再被系統放大而變模糊。
+   15. 勾選「用 Qwen3-ASR＋Parakeet 交叉比對」時，Whisper 轉錄完後，每一條字幕的那段聲音會再給
+       Qwen3-ASR（Qwen/Qwen3-ASR-1.7B）和 NVIDIA Parakeet（nvidia/parakeet-tdt_ctc-0.6b-ja）各聽一次，
+       三個結果逐段投票：另外兩個模型寫得一樣、跟 Whisper 不同的地方，改成它們的寫法（2 票勝 1 票）；
+       兩個模型意見不同就維持 Whisper。標點、語助詞、讀音相同的不同寫法、勾選的 hotwords（人名）不會被改。
+       每一處修改、以及差很多的字幕都會列在日誌；另外兩個模型都聽不到任何字的字幕會列為可能是幻覺。
+       修正發生在對齊之前，所以對齊和拆分用的都是修正後的文字。輸出檔名會多一個 _cross。
+       需要另外安裝：pip install -U qwen-asr 和 pip install -U "nemo_toolkit[asr]"（模型第一次使用會自動下載，
+       合計約 7 GB）。兩個模型各自在獨立的程序（asr_worker.py，要跟 w1_1.py 放在一起）裡跑；
+       套件版本互相衝突時可以裝在不同的虛擬環境，在 whisper_app/config.py 的 CROSS_BACKENDS 指定各自的 python.exe。
+       只有一個裝得起來時，只做比對、列出差異，不會自動修正。其他設定在 config.py 的「多模型交叉比對」設定區。
 """
 
 from __future__ import annotations

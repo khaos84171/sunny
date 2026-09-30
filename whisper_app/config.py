@@ -136,6 +136,50 @@ ALIGN_REFINE_THRESHOLD = 0.30    # 多大聲才算「有聲音」：在背景到
                                  # 調大 = 保守（只認明顯的聲音，起點會比較晚、終點比較早，不容易把呼吸聲當成開頭）；調小 = 敏感
 ALIGN_AGREE_SEC = 0.04           # CTC 與聲音的差距不超過這麼多秒，統計時算「一致」
 
+# === 多模型交叉比對（Qwen3-ASR ＋ NVIDIA Parakeet 修正 Whisper 聽錯的字）===
+# 視窗上勾選「交叉比對」時，Whisper 轉錄完後，把每一條字幕的那一段聲音再交給另外兩個獨立的辨識模型各聽一次，
+# 三個結果逐段比較（ROVER 多數決）：
+#   ・三個模型都一樣的地方 → 當作錨點，不動
+#   ・錨點之間不一樣的地方：另外兩個模型「完全一致」、而且跟 Whisper 不同 → 改成它們的寫法（2 票勝 1 票）
+#   ・另外兩個模型彼此也不一致 → 維持 Whisper（沒有多數，不亂改）
+# 比較時忽略標點、空白、全形半形、平假名／片假名、漢數字／阿拉伯數字的差別（例如「3人」＝「三人」不算不同），
+# 標點與寫法以 Whisper 為主，只在真的聽成不同字時才換。每一處修改都會列在日誌裡。
+# 字幕開頭／結尾的「多一個字、少一個字」不改：那常常只是切出來的聲音多包到或少包到前後句的一點點。
+# 另外兩個模型都聽不到任何字的字幕（多半是 Whisper 在靜音或音樂上編出來的）會列為建議檢查。
+#
+# 需要另外安裝（各自有自己的 PyTorch 相依套件，裝不起來時可以用獨立的虛擬環境，見下面 *_PYTHON）：
+#   Qwen3-ASR：pip install -U qwen-asr                      （模型約 4.7 GB，第一次使用自動從 Hugging Face 下載）
+#   Parakeet ：pip install -U "nemo_toolkit[asr]"           （模型約 2.5 GB；NeMo 在 Windows 上比較難裝，可以只用 Qwen3-ASR）
+# 只有一個模型能用時，只做比對、列出差異（兩票對一票才算多數，一票對一票不改）。
+CROSS_MODELS = ["qwen3", "parakeet"]      # 要用哪些模型（名稱見下面 CROSS_BACKENDS）；拿掉其中一個就只做比對不修正
+CROSS_BACKENDS = {
+    "qwen3": dict(
+        label="Qwen3-ASR",
+        model="Qwen/Qwen3-ASR-1.7B",      # 顯存不夠可改成 "Qwen/Qwen3-ASR-0.6B"
+        python="",                         # 空字串 = 用跑這個程式的同一個 Python；裝在別的虛擬環境時填那個 python.exe 的完整路徑
+        language="Japanese",
+        use_hotwords=True,                 # 把勾選的 hotwords 當成提示（context）給 Qwen3-ASR，人名比較不會聽錯
+        batch_size=8,
+    ),
+    "parakeet": dict(
+        label="Parakeet",
+        model="nvidia/parakeet-tdt_ctc-0.6b-ja",
+        python="",
+        decoder="tdt",                     # "tdt"（較準）或 "ctc"（較快）
+        batch_size=8,
+    ),
+}
+CROSS_DEVICE = "auto"            # "auto" = 有 NVIDIA GPU 就用，沒有就用 CPU（很慢）；也可寫死 "cuda"／"cpu"
+CROSS_KEEP_ALIVE_SEC = 120       # 做完後程序留著等下一個檔案幾秒（省掉重新載入模型）；0 = 每個檔案都重新載入
+CROSS_PAD_SEC = 0.25             # 每條字幕的聲音前後各多取幾秒（Whisper 的時間常常偏一點；不會超過前後句的時間）
+CROSS_MIN_VOTES = 2              # 至少要有幾個模型寫法一致，才改掉 Whisper 的寫法
+CROSS_MAX_CHANGE_CHARS = 12      # 一處修改最多換掉幾個字；超過就只列在日誌，不改（一大段完全不同，多半是切錯聲音或整句幻覺）
+CROSS_REVIEW_SIM = 0.5           # Whisper 跟每個模型的相似度都低於這個值（0～1）時，列為建議檢查
+CROSS_DROP_UNHEARD = False       # True = 另外兩個模型都聽不到任何字的字幕直接刪掉（預設只列出來，不刪）
+# 語助詞：某一處的差別「只是多了／少了這些詞」時不改（Whisper 常常省略「えー」「あの」，字幕通常也不需要它們）
+CROSS_FILLERS = ("えーっと", "えっと", "えーと", "ええと", "えー", "ええ", "あー", "あのー", "あの", "うーん", "うん", "んー", "まあ", "まぁ")
+CROSS_PROGRESS_SHARE = 0.15      # 交叉比對佔進度條的比例
+
 # === 字幕拆分設定（解決 Whisper 把好幾句塞進同一條字幕）===
 # 依序套用三種切法：
 #   1. 句尾標點（。！？ 等）後面一律切開
@@ -183,3 +227,4 @@ NO_START_PARTICLES = {"は", "が", "を", "に", "の", "も", "と", "へ", "�
 # 「Could not load symbol cudnnGetLibConfig. Error code 127」，所以對齊跟 Demucs 一樣
 # 用獨立程序跑，主程式完全不 import torch。
 ALIGN_WORKER = BASE_DIR / "align_worker.py"
+ASR_WORKER = BASE_DIR / "asr_worker.py"      # 交叉比對用的 Qwen3-ASR／Parakeet 也一樣用獨立程序跑

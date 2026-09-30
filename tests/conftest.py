@@ -1,7 +1,7 @@
 """pytest 共用設定。
 
 - 把專案根目錄和 tests/stubs 放進 sys.path：測試不需要真的 faster-whisper、tkinterdnd2、GPU。
-- 每個測試都自動隔離：設定檔、輸出資料夾指到暫存目錄，取消狀態、模型快取、常駐的對齊程序都在前後重設。
+- 每個測試都自動隔離：設定檔、輸出資料夾指到暫存目錄，取消狀態、模型快取、常駐的對齊／交叉比對程序都在前後重設。
 """
 import sys
 from pathlib import Path
@@ -17,7 +17,7 @@ for path in (str(TESTS / "stubs"), str(ROOT)):
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
-    from whisper_app import aligner, config, devices, jobs, runtime, transcribe
+    from whisper_app import aligner, config, cross_asr, devices, jobs, runtime, transcribe
 
     out, sep = tmp_path / "out", tmp_path / "sep"
     out.mkdir()
@@ -39,6 +39,7 @@ def isolated(tmp_path, monkeypatch):
     jobs.JOBS._generation = 0
     jobs.JOBS._job_generation = 0
     aligner.ALIGN_SERVER._proc = None
+    cross_asr.SERVERS.clear()
 
 
 @pytest.fixture

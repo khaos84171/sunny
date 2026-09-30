@@ -202,6 +202,21 @@ def test_startup_notes_are_written_to_the_window(make_app):
     assert "注意：測試用的啟動訊息" in window_text(app)
 
 
+def test_cross_check_option_is_off_by_default_remembered_and_sent_with_the_job(make_app, monkeypatch, tmp_path):
+    app = make_app()
+    assert app.use_cross_var.get() is False                               # 要另外裝模型，預設不勾
+    got = []
+    monkeypatch.setattr(gui, "process_file", lambda path, *a, **k: got.append(k.get("use_cross")))
+    app.use_cross_var.set(True)
+    media = tmp_path / "a.mp4"
+    media.write_bytes(b"1")
+    app._handle_dropped([str(media)])
+    assert wait_for(lambda: got == [True])
+    spin(app.root, 0.8)
+    assert json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))["use_cross"] is True
+    assert make_app().use_cross_var.get() is True
+
+
 # ================= 取消 / 佇列 / 拖放 =================
 @pytest.fixture
 def fake_jobs(monkeypatch):
