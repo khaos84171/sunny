@@ -19,9 +19,9 @@ from .timing import apply_alignment, finalize_aligned_timing, report_alignment
 from .transcribe import build_hotwords, get_model, looks_like_hallucination
 
 
-def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
+def align_existing_srt(srt_path: str, media_path: str,
                        log_func, progress_func, add_blank: bool = True) -> str:
-    """只對齊：讀取現有 SRT 的文字與大略時間，用影片音訊重新校正時間戳，不跑 Whisper。"""
+    """只對齊：讀取現有 SRT 的文字與大略時間，用影片音訊重新校正時間戳，不跑 Whisper，也不做人聲分離。"""
     srt_path = Path(srt_path)
     media_path = Path(media_path)
 
@@ -37,29 +37,18 @@ def align_existing_srt(srt_path: str, media_path: str, use_sep: bool,
     log_func(f"讀到 {len(segments)} 條字幕"
              + (f"（另有 {n_blank} 條空白字幕，已略過）" if n_blank else ""))
 
-    # 有做人聲分離時，分離佔進度條的前一段，對齊縮進剩下的部分
-    overall_progress = progress_func
-    if use_sep:
-        audio_input = separate_vocals(
-            str(media_path), runtime.separation_work_dir, log_func,
-            device=config.SEPARATION_DEVICE, model_name=config.SEPARATION_MODEL,
-            segment=config.SEPARATION_SEGMENT,
-            progress_func=lambda frac: overall_progress(config.SEPARATION_PROGRESS_SHARE * frac),
-        )
-        progress_func = lambda frac: overall_progress(
-            config.SEPARATION_PROGRESS_SHARE + (1 - config.SEPARATION_PROGRESS_SHARE) * frac)
-    else:
-        audio_input = str(media_path)
+    # 只對齊不做人聲分離：直接用影片／音訊本身（不管視窗上有沒有勾「先用 Demucs 分離人聲」）
     JOBS.check()
 
-    result = run_alignment(audio_input, segments, log_func, progress_func)
+    # detect_offset：剪輯軟體匯出的字幕常從 01:00:00 開始，整個差一小時；偵測到就先扣掉再對齊，輸出維持原本的時間軸
+    result = run_alignment(str(media_path), segments, log_func, progress_func, detect_offset=True)
     apply_alignment(segments, result, log_func)
     # 輸出用另一份，檢查報告才看得到後處理（提早出現、防重疊）之前的對齊時間
     subs = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],
              "src": i, "aligned": seg["aligned"]} for i, seg in enumerate(segments)]
     finalize_aligned_timing(subs, result["duration"])
     if add_blank:
-        add_leading_blank(subs, log_func)
+        add_leading_blank(subs, log_func, origin=result["offset"])
     report_alignment(segments, subs, log_func)
 
     JOBS.check()
@@ -102,13 +91,15 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         transcribe_input = str(input_path)
     JOBS.check()
 
-    model = get_model(log_func)
+    # 載入模型、解碼音訊、轉錄每一段都是停不下來的呼叫：用可中斷的方式等，按取消才能馬上反應
+    model = JOBS.run_interruptibly(get_model, log_func)
 
     # hotwords 由前端勾選傳入；每部影片出場的人不同，只放這次用得到的詞
     hotwords = build_hotwords(hotword_list)
     log_func(f"本次使用的 hotwords：{hotwords if hotwords else '（無）'}")
 
-    segments, info = model.transcribe(
+    segments, info = JOBS.run_interruptibly(
+        model.transcribe,
         transcribe_input,
         **config.TRANSCRIBE_OPTIONS,
         word_timestamps=use_split,  # 拆分需要每個詞的時間
@@ -125,8 +116,8 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
     transcribe_weight = 1.0 - align_weight - cross_weight
     total = max(info.duration, 0.01)
     raw = []  # Whisper 原本的片段（還沒拆）
-    for segment in segments:
-        JOBS.check()  # Whisper 是在這個迴圈裡一段一段轉錄的，取消最慢等到目前這一段做完
+    for segment in JOBS.iter_interruptibly(segments):  # Whisper 是在這個迴圈裡一段一段轉錄的；按取消不用等它做完手上這段
+        JOBS.check()
         text = segment.text.strip()
         no_speech = getattr(segment, "no_speech_prob", None)
         if looks_like_hallucination(text, no_speech, getattr(segment, "avg_logprob", None)):

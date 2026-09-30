@@ -10,7 +10,7 @@ import numpy as np
 from faster_whisper import decode_audio
 
 from . import config
-from .jobs import JobCancelled, _console_python
+from .jobs import JOBS, JobCancelled, _console_python
 from .workers import WorkerServer
 
 
@@ -64,7 +64,7 @@ def run_cross_asr(audio_path: str, segments: list[dict], hotwords: list[str],
     if not names or not segments:
         return hyps, []
 
-    audio = decode_audio(audio_path, sampling_rate=config.SAMPLE_RATE)
+    audio = JOBS.run_interruptibly(decode_audio, audio_path, sampling_rate=config.SAMPLE_RATE)  # 長影片要解碼好幾秒
     duration = len(audio) / config.SAMPLE_RATE
     spans = clip_spans(segments, duration)
     used = []

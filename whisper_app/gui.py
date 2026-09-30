@@ -344,9 +344,6 @@ class App:
         ttk.Label(
             status_row, textvariable=self.status_var, style="Status.TLabel",
         ).pack(side="left")
-        ttk.Button(
-            status_row, text="取消處理", style="Small.RedOutline.TButton", command=self.cancel_all,
-        ).pack(side="right")
 
         self.progress = ttk.Progressbar(
             inner, mode="determinate", maximum=100, style="Red.Horizontal.TProgressbar",
@@ -456,6 +453,13 @@ class App:
             font=(Theme.FONT_FAMILY, 16, "bold"), width=2, height=1,
         )
         mark.pack(side="left", padx=(0, 10))
+
+        # 取消按鈕放在最上方橫幅的右側，而且要先於標題文字排版：pack 是先排的先分到空間，
+        # 視窗縮小、標題或狀態文字再長，也只會擠到標題，按鈕永遠看得到
+        self.cancel_button = ttk.Button(
+            inner, text="取消處理", style="RedOutline.TButton", command=self.cancel_all,
+        )
+        self.cancel_button.pack(side="right", padx=(10, 0))
 
         text_col = tk.Frame(inner, bg=Theme.RED)
         text_col.pack(side="left", fill="x", expand=True)
@@ -576,7 +580,7 @@ class App:
                     continue
                 used_media.add(media)
                 self._enqueue({"kind": "align_only", "srt": srt, "media": media,
-                               "use_sep": use_sep, "add_blank": add_blank})
+                               "add_blank": add_blank})
                 self.log(f">>> 已加入佇列（只對齊）：{Path(srt).name}  ⇄  {Path(media).name}")
             for m in media_files:
                 if m not in used_media:
@@ -631,7 +635,7 @@ class App:
                 self.set_status(f"{'對齊中' if is_align_only else '處理中'}：{name}")
                 self.set_progress(0)
                 if is_align_only:
-                    align_existing_srt(job["srt"], job["media"], job["use_sep"],
+                    align_existing_srt(job["srt"], job["media"],
                                        self.log, self.set_progress,
                                        add_blank=job["add_blank"])
                 else:

@@ -43,7 +43,8 @@
         ・連續語音（沒有停頓可貼）、背景聲太大（對比不夠）時維持 CTC 的時間
     同時它就是交叉驗證：每個詞的起點、終點各記一個狀態（result.json 的 checks）——
         ok 兩種算法一致（差距在 agree_sec 內）／moved 依聲音修正／cont 連續語音無法判定／
-        noisy 背景聲太大無法判定／silent CTC 說有字的地方卻聽不到聲音（可能是 Whisper 幻覺）
+        unclear 邊界剛好落在弱音或停頓上無法判定／noisy 背景聲太大無法判定／
+        silent 整個詞前後都聽不到聲音（可能是 Whisper 幻覺）
     處理完會在日誌印出一致率、修正量的統計。
 
 用法：
@@ -214,10 +215,11 @@ REFINE_DEFAULTS = {
     "agree_sec": 0.04,         # CTC 跟聲音的差距不超過這麼多秒 → 視為「一致」
     "ctx_sec": 1.0,            # 估背景與最大聲時，詞前後各看幾秒
     "quiet_db": 20.0,          # 詞附近整片都比一般說話音量小這麼多 dB → 判定「該處聽不到聲音」
+    "silent_pad_sec": 0.10,    # 判定「聽不到聲音」時，詞的前後各看幾秒：這範圍內完全沒有聲音才算
 }
 
 STATUS_LABELS = {"ok": "一致", "moved": "依聲音修正", "silent": "該處聽不到聲音",
-                 "cont": "連續語音", "noisy": "背景聲太大或沒有停頓"}
+                 "cont": "連續語音", "unclear": "邊界落在弱音或停頓上", "noisy": "背景聲太大或沒有停頓"}
 
 
 def energy_envelope_db(audio, sr: int) -> np.ndarray:
@@ -247,7 +249,8 @@ def _find_onset(env, i0: int, lo_i: int, fwd_i: int, thr: float, dip_n: int):
     fwd_i = 往後最多找到哪一格。回傳 (第一格有聲音的位置, 種類)：
         "edge"   找到明確的「靜音 → 有聲」，回傳的是有聲那一段的第一格
         "cont"   i0 有聲音，但一路往前找到下限都沒有中斷（前面是連續的聲音，可能是上一個詞、背景音）→ 沒有證據
-        "silent" i0 沒有聲音，往後找也沒有 → CTC 說有字的地方聽不到聲音
+        "silent" i0 沒有聲音，往後找也沒有 → 這個位置沒有聲音（是整個詞附近都安靜，還是只是剛好落在弱音上，
+                 由呼叫的人再判斷：見 _refine_one）
     終點也用同一個函式：把 env 前後反轉再呼叫，「開始」就變成「結束」。
     """
     if env[i0:i0 + 3].max() >= thr:
@@ -295,12 +298,18 @@ def _refine_one(env, s: float, e: float, lo_t, hi_t, c: dict, ref_level=None):
     thr = min(thr, level - 3.0)
     dip_n = max(1, int(round(c["dip_sec"] / hop)))
 
+    # 「聽不到聲音」要整個詞的前後都安靜才算：只是起訖點剛好落在弱音上（無聲子音、促音「っ」、輕聲的「ク」，
+    # 或是兩個詞之間的小空隙）不是沒有聲音——那是說話本來就有的起伏
+    pad = c["silent_pad_sec"]
+    if env[idx(s - pad): idx(e + pad) + 1].max() < thr:
+        return s, e, ["silent", None, "silent", None]
+
     # ---- 起點 ----
     lo_eff = s - c["back_sec"] if lo_t is None else min(max(lo_t, s - c["back_sec"]), s)
     i_s = idx(s)
     j, kind = _find_onset(env, i_s, min(idx(lo_eff), i_s), max(idx(min(s + c["fwd_sec"], e - MIN_UNIT_SEC)), i_s),
                           thr, dip_n)
-    s2, s_status, s_delta = s, kind, None
+    s2, s_status, s_delta = s, ("unclear" if kind == "silent" else kind), None
     if kind == "edge":
         s2 = s if j == i_s else max(tm(j), lo_eff)
         s_delta = s2 - s
@@ -313,7 +322,7 @@ def _refine_one(env, s: float, e: float, lo_t, hi_t, c: dict, ref_level=None):
     bottom = min(idx(max(e - c["end_back_sec"], s2 + MIN_UNIT_SEC)), i_e)
     rev = env[bottom:top + 1][::-1]
     j, kind = _find_onset(rev, top - i_e, 0, top - bottom, thr, dip_n)
-    e2, e_status, e_delta = e, kind, None
+    e2, e_status, e_delta = e, ("unclear" if kind == "silent" else kind), None
     if kind == "edge":
         e2 = e if top - j == i_e else min(tm(top - j), hi_eff)
         e_delta = e2 - e
@@ -367,7 +376,7 @@ def summarize_checks(flat_checks: list) -> list[str]:
                              f"中位數 {np.median(deltas):+.2f} 秒，最大 {deltas[np.abs(deltas).argmax()]:+.2f} 秒）")
             if count["silent"]:
                 parts.append(f"該處聽不到聲音 {count['silent']} 個")
-        skipped = [f"{STATUS_LABELS[k]} {count[k]}" for k in ("cont", "noisy") if count[k]]
+        skipped = [f"{STATUS_LABELS[k]} {count[k]}" for k in ("cont", "unclear", "noisy") if count[k]]
         if skipped:
             parts.append("無法判定：" + "、".join(skipped))
         lines.append(f"{label}：" + "；".join(parts))

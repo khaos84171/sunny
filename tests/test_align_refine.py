@@ -146,8 +146,8 @@ def test_refine_moves_a_too_early_start_later_but_only_slightly(worker_module):
     env = worker_module.energy_envelope_db(synth_speech(5, words), SR)
     new, checks = worker_module.refine_boundaries(env, [(1.96, 2.9)])    # CTC 起點在聲音開始前 0.04 秒
     assert abs(new[0][0] - 2.0) <= 0.015 and checks[0][0] in ("ok", "moved")
-    new, checks = worker_module.refine_boundaries(env, [(1.8, 2.9)])     # 早了 0.2 秒：超過 fwd_sec → 聽不到
-    assert new[0][0] == 1.8 and checks[0][0] == "silent"
+    new, checks = worker_module.refine_boundaries(env, [(1.8, 2.9)])     # 早了 0.2 秒：超過 fwd_sec → 不敢動，也不算「聽不到聲音」
+    assert new[0][0] == 1.8 and checks[0][0] == "unclear"              # （詞的範圍內明明有聲音，只是起點附近沒有）
 
 
 def test_refine_flags_words_placed_where_there_is_no_sound(worker_module):
@@ -423,6 +423,31 @@ def test_align_job_ctc_words_in_silence_are_flagged(worker_module, tmp_path):
     assert result["checks"][3] == [["silent", None, "silent", None]]
     assert result["spans"][3][0] == pytest.approx(7.05, abs=0.03)
     assert all(c[0][0] != "silent" for c in result["checks"][:3])
+
+
+def test_a_weak_sound_between_loud_ones_is_not_reported_as_silence(worker_module):
+    """實際使用的日誌裡，一段影片 373 條字幕有 74 條被標「聽不到聲音」，多半是「ク」「っ」「た」這種很短、很弱的詞：
+    CTC 的一格（20 毫秒）剛好落在無聲子音、促音或兩個音節之間的小凹陷上。前後明明有大聲的字，不能算聽不到聲音。"""
+    words = [(1.0, 1.4, 0.0), (1.42, 1.48, 0.06), (1.52, 1.9, 0.0), (4.0, 4.4, 0.0)]   # 中間那個詞只有 60 毫秒很弱的雜訊
+    env = worker_module.energy_envelope_db(synth_speech(6, words), SR)
+    new, checks = worker_module.refine_boundaries(env, [(1.05, 1.38), (1.44, 1.46), (1.58, 1.85), (4.05, 4.3)])
+    assert "silent" not in (checks[1][0], checks[1][2])              # 弱音本身：可能貼得到、也可能無法判定，但不是「聽不到」
+    assert all("silent" not in (c[0], c[2]) for c in checks)
+    # 對照：詞的前後 0.1 秒都沒有聲音（落在兩段話中間的空白裡，附近 1 秒內有人在說話），才是聽不到
+    words = [(1.0, 1.4, 0.0), (2.0, 2.4, 0.0), (3.4, 3.8, 0.0)]
+    env = worker_module.energy_envelope_db(synth_speech(6, words), SR)
+    new, checks = worker_module.refine_boundaries(env, [(1.05, 1.38), (2.05, 2.35), (2.9, 3.0), (3.45, 3.75)])
+    assert checks[2] == ["silent", None, "silent", None] and new[2] == (2.9, 3.0)
+    assert all("silent" not in (c[0], c[2]) for i, c in enumerate(checks) if i != 2)
+
+
+def test_a_boundary_on_a_dip_is_unclear_not_silent(worker_module):
+    """詞的前後 0.1 秒內有聲音（不算聽不到），但起訖點各落在空白上、離聲音超過搜尋範圍：無法判定（unclear），時間不動。"""
+    env = np.full(600, -80.0)
+    env[130:140] = -20.0                       # 0.66～0.71 秒有聲音
+    env[300:340] = -20.0                       # 1.51～1.71 秒有聲音；中間是空白
+    s, e, check = worker_module._refine_one(env, 0.76, 1.41, None, None, worker_module.REFINE_DEFAULTS)
+    assert (s, e) == (0.76, 1.41) and check == ["unclear", None, "unclear", None]
 
 
 def test_quiet_surroundings_are_silent_but_a_loud_background_is_only_noisy(worker_module):
