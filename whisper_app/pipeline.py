@@ -13,7 +13,7 @@ from .crosscheck import apply_crosscheck
 from .jobs import JOBS, JobCancelled
 from .models import Word
 from .separation import separate_vocals
-from .splitter import _ensure_min_display, split_boundary_mode, split_segment
+from .splitter import _ensure_min_display, merge_fragments, split_boundary_mode, split_segment
 from .srt_io import add_leading_blank, format_timestamp, is_blank_text, parse_srt, write_srt
 from .timing import apply_alignment, finalize_aligned_timing, report_alignment
 from .transcribe import build_hotwords, get_model, looks_like_hallucination
@@ -183,6 +183,11 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         if len(pieces) > 1:
             log_func(f"[拆分] {seg['text']}\n    → " + " ／ ".join(p["text"] for p in pieces))
         subs.extend(pieces)
+    if use_split and config.MERGE_FRAGMENTS:
+        # Whisper 自己把一句話分成兩段時，split_segment 看不到：拆完後再把跨片段的交界接回去
+        subs, merge_notes = merge_fragments(subs)
+        for note in merge_notes:
+            log_func(f"[合併] {note}")
     if use_split:
         log_func(f"[拆分] Whisper 原本 {len(raw)} 段 → 拆成 {len(subs)} 條字幕"
                  f"（切點判斷：{split_boundary_mode()}）")

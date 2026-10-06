@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import tempfile
@@ -43,6 +44,67 @@ def _get_janome():
 
 def split_boundary_mode() -> str:
     return "janome 斷詞" if _JanomeTokenizer is not None else "簡易規則（建議 pip install janome）"
+
+
+# 不能放在字幕開頭的字：小寫假名、長音、濁點
+_NO_START_CHARS = "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶーｰ゛゜"
+
+
+@functools.lru_cache(maxsize=4096)
+def _token_ends(text: str) -> frozenset[int]:
+    """janome 斷詞後，每個詞結束的字元位置。"""
+    ends, pos = set(), 0
+    for t in _get_janome().tokenize(text):
+        pos += len(t.surface)
+        ends.add(pos)
+    return frozenset(ends)
+
+
+def _attach_prefix_len(text: str) -> int:
+    """
+    text 開頭（略過空白）是不是 config.ATTACH_PREV_WORDS 裡的詞（接在前一句後面的詞）。
+    是的話回傳那個詞的長度，否則 0。有 janome 時要在詞的交界結束（「よし」不算「よ」）；
+    沒裝時，單字的詞後面必須是標點、空白或結尾（「ねえ」「よし」不算）。
+    """
+    t = text.lstrip()[:16]
+    for cand in sorted(config.ATTACH_PREV_WORDS, key=len, reverse=True):
+        if not t.startswith(cand):
+            continue
+        if _JanomeTokenizer is not None:
+            if len(cand) in _token_ends(t):
+                return len(cand)
+        else:
+            nxt = t[len(cand):len(cand) + 1]
+            if len(cand) > 1 or not nxt or unicodedata.category(nxt)[0] in "PZS":
+                return len(cand)
+    return 0
+
+
+def _attach_at(words, j: int) -> bool:
+    """words[j] 開頭的這句話，是不是接在前一句後面的詞（けど、とか、だと…）。"""
+    return j < len(words) and _attach_prefix_len("".join(w.word for w in words[j:j + 8])) > 0
+
+
+def _continues(text: str) -> bool:
+    """這段文字是不是停在助詞上（「私は」「記録を」「強みって」：話還沒說完）。"""
+    t = text.rstrip()
+    if not t:
+        return False
+    if _JanomeTokenizer is not None:
+        last = None
+        for tok in _get_janome().tokenize(t[-12:]):
+            if tok.surface.strip():
+                last = tok
+        if last is None:
+            return False
+        pos = last.part_of_speech.split(",")
+        if pos[0] == "助詞":
+            if pos[1] == "接続助詞":
+                return last.surface in ("て", "で", "と", "ば")   # 「ので」「けど」「から」是子句結尾
+            return pos[1] in ("格助詞", "係助詞", "副助詞", "並立助詞", "連体化")
+        # janome 偶爾把單獨的助詞判成別的詞性，用字面補一次
+        return last.surface in config.CONTINUE_ENDINGS and not t.endswith(config.CLAUSE_END_SUFFIXES)
+    return t.endswith(config.CONTINUE_ENDINGS) and not t.endswith(config.CLAUSE_END_SUFFIXES + config.CONTINUE_EXCLUDE)
 
 
 def _can_break(prev: list[str], cur: list[str]) -> bool:
@@ -98,7 +160,7 @@ def _heuristic_can_break(left_text: str, right_word: str) -> bool:
     a, b = left_text.rstrip(), right_word.lstrip()
     if not a or not b:
         return True
-    if b[0] in "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶーｰ゛゜" or b[0] in config.CLOSING_CHARS or b in config.PARTICLE_SURFACES:
+    if b[0] in _NO_START_CHARS or b[0] in config.CLOSING_CHARS or b in config.PARTICLE_SURFACES:
         return False
     ca, cb = _char_class(a[-1]), _char_class(b[0])
     if ca == cb and ca in ("kanji", "katakana", "alnum") and not right_word[:1].isspace():
@@ -120,9 +182,9 @@ def _allowed_cuts(words) -> list[bool]:
             result.append(end in ok)
         return result
     result, left = [], ""
-    for w, nxt in zip(words, words[1:]):
+    for k, (w, nxt) in enumerate(zip(words, words[1:])):
         left += w.word
-        result.append(_heuristic_can_break(left, nxt.word))
+        result.append(_heuristic_can_break(left, nxt.word) and not _attach_at(words, k + 1))
     return result
 
 
@@ -159,8 +221,13 @@ def _sentence_end_flags(words) -> list[bool]:
     return flags
 
 
+def _char_limit() -> int:
+    """單條字幕的字數上限（SPLIT_MAX_CHARS 再加上一點容許量，只多一兩個字不硬切）。"""
+    return config.SPLIT_MAX_CHARS + config.SPLIT_OVERFLOW_CHARS
+
+
 def _too_long(words) -> bool:
-    return (_char_count(_words_text(words)) > config.SPLIT_MAX_CHARS
+    return (_char_count(_words_text(words)) > _char_limit()
             or words[-1].end - words[0].start > config.SPLIT_MAX_DURATION)
 
 
@@ -199,6 +266,8 @@ def _best_cut_pass(words, ok: list[bool] | None) -> int | None:
             score += 0.3
         if words[k + 1].word.strip() in config.NO_START_PARTICLES:
             score -= 1.0
+        if words[k].word.strip().endswith("の"):
+            score -= 0.8   # 「生みの｜親」「ミッキーマウスの｜声優」：修飾語和後面的名詞不要拆開
         score += 0.5 * (1 - abs(left - right) / max(total, 1))
         if score > best_score:
             best_k, best_score = k, score
@@ -228,15 +297,32 @@ def split_segment(seg: dict) -> list[dict]:
     ok = _allowed_cuts(words)  # 哪些位置是文節交界（不會切在一個詞的中間）
     ends = _sentence_end_flags(words)  # 哪些詞是句尾（已把後面的右括號算進去）
 
-    # 第 1、2 步：句尾標點 → 切；明顯停頓而且剛好在文節交界 → 切
+    # 字數的累計，以及從每個詞往後第一個句尾的位置（停頓切時，檢查右邊那一塊夠不夠長）
+    cum = [0]
+    for w in words:
+        cum.append(cum[-1] + _char_count(w.word))
+    next_end, nearest = [0] * len(words), len(words) - 1
+    for i in range(len(words) - 1, -1, -1):
+        if ends[i]:
+            nearest = i
+        next_end[i] = nearest
+
+    # 第 1、2 步：句尾標點 → 切；明顯停頓而且剛好在文節交界 → 切。
+    # 但下一個詞若是接在前一句後面的（けど、とか、だと…），標點多半是 Whisper 誤標，不切
     groups, start = [], 0
     for i in range(len(words) - 1):
         w, nxt = words[i], words[i + 1]
-        if ends[i]:
-            cut = True
-        else:
-            cut = (ok[i] and nxt.start - w.end >= config.SPLIT_PAUSE_SEC
-                   and _char_count(_words_text(words[start:i + 1])) >= config.SPLIT_MIN_CHARS)
+        cut = ends[i]
+        pause = nxt.start - w.end
+        if not cut and ok[i] and pause >= config.SPLIT_PAUSE_SEC:
+            left_text = _words_text(words[start:i + 1])
+            soft = left_text.endswith(tuple(config.SOFT_BREAK_CHARS))   # 左邊以「、」結尾：本來就是斷點
+            need = config.SPLIT_MIN_CHARS if soft else config.SPLIT_MIN_CHARS_PAUSE
+            right = cum[next_end[i + 1] + 1] - cum[i + 1]
+            cut = (_char_count(left_text) >= need and right >= need
+                   and (soft or pause >= config.SPLIT_PAUSE_CONTINUE_SEC or not _continues(left_text)))
+        if cut and _attach_at(words, i + 1):
+            cut = False
         if cut:
             groups.append((start, i + 1))
             start = i + 1
@@ -248,6 +334,53 @@ def split_segment(seg: dict) -> list[dict]:
         for part in _split_long(words[a:b], ok[a:b - 1]):
             pieces.append({"start": part[0].start, "end": part[-1].end, "text": _words_text(part)})
     return pieces
+
+
+def _join_text(a: str, b: str) -> str:
+    """日文直接接；兩邊都是英數字時補一個空格，免得黏成一個字。"""
+    if a and b and a[-1].isascii() and a[-1].isalnum() and b[0].isascii() and b[0].isalnum():
+        return a + " " + b
+    return a + b
+
+
+def _merge_reason(a: dict, b: dict) -> str | None:
+    """相鄰兩條字幕該不該併成一條；該併回傳原因，否則 None。"""
+    if a.get("src") is None or b.get("src") is None or a["src"] == b["src"]:
+        return None   # 同一段 Whisper 片段內的切法已經由 split_segment 決定過，這裡只看跨片段的交界
+    if b["start"] - a["end"] > config.MERGE_MAX_GAP_SEC:
+        return None
+    if (_char_count(a["text"]) + _char_count(b["text"]) > _char_limit()
+            or b["end"] - a["start"] > config.SPLIT_MAX_DURATION):
+        return None
+    if _attach_prefix_len(b["text"]) > 0:
+        return "接在前一句後面的詞"
+    if b["text"].strip() and b["text"].lstrip()[0] in _NO_START_CHARS:
+        return "長音／小寫假名開頭"
+    if not a["text"].rstrip().endswith(tuple(config.SENTENCE_END_CHARS + config.SOFT_BREAK_CHARS)) and _continues(a["text"]):
+        return "前一條停在助詞上"
+    return None
+
+
+def merge_fragments(subs: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Whisper 有時把一句話分成兩段（交界剛好在句子中間），split_segment 是一段一段處理的，看不到。
+    所以拆完後再掃一次：相鄰、來自不同 Whisper 片段、空隙很小的兩條字幕，如果後一條是接在前一條後面的
+    （けど／とか…開頭、長音開頭，或前一條停在助詞上），而且併起來不超過上限，就併成一條。
+    回傳 (併完的字幕, 每一處合併的說明)；併過的字幕 "srcs" 列出它涵蓋的所有 Whisper 片段編號。
+    """
+    out, notes = [], []
+    for sub in subs:
+        reason = _merge_reason(out[-1], sub) if out else None
+        if reason is None:
+            out.append(dict(sub))
+            continue
+        prev = out[-1]
+        notes.append(f"{prev['text']} ＋ {sub['text']}（{reason}）")
+        prev["srcs"] = (prev.get("srcs") or [prev["src"]]) + (sub.get("srcs") or [sub["src"]])
+        prev["text"] = _join_text(prev["text"], sub["text"])
+        prev["end"] = sub["end"]
+        prev["aligned"] = bool(prev.get("aligned") and sub.get("aligned"))
+    return out, notes
 
 
 def _ensure_min_display(segments: list[dict]):

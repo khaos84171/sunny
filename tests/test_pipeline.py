@@ -58,6 +58,53 @@ def stub(monkeypatch):
     return stub
 
 
+# ---------------- 拆分與跨片段合併 ----------------
+def seg_with_words(start, end, text, tokens):
+    """tokens = [(詞, 起, 迄), ...]"""
+    seg = Seg(start, end, text)
+    seg.words = [types.SimpleNamespace(start=a, end=b, word=w) for w, a, b in tokens]
+    return seg
+
+
+def test_sentence_split_across_two_whisper_segments_is_merged(stub):
+    stub.model.segments = [
+        seg_with_words(0.0, 1.0, "でもペアの強みって", [("でも", 0.0, 0.3), ("ペア", 0.3, 0.6), ("の", 0.6, 0.7), ("強み", 0.7, 0.9), ("って", 0.9, 1.0)]),
+        seg_with_words(1.2, 2.5, "押した後だと思うんですよ。", [("押した", 1.2, 1.6), ("後", 1.6, 1.8), ("だ", 1.8, 1.9), ("と", 1.9, 2.0), ("思う", 2.0, 2.2), ("んです", 2.2, 2.4), ("よ", 2.4, 2.45), ("。", 2.45, 2.5)]),
+        seg_with_words(3.0, 4.0, "次の問題です。", [("次の", 3.0, 3.4), ("問題", 3.4, 3.8), ("です", 3.8, 3.95), ("。", 3.95, 4.0)]),
+    ]
+    out, logs, _ = stub.run()
+    blocks = Path(out).read_text(encoding="utf-8").strip().split("\n\n")
+    assert [b.split("\n", 2)[2] for b in blocks] == ["でもペアの強みって押した後だと思うんですよ。", "次の問題です。"]
+    assert blocks[0].split("\n")[1] == "00:00:00,000 --> 00:00:02,500"
+    assert any(x.startswith("[合併]") and "でもペアの強みって" in x for x in logs)
+    assert any("Whisper 原本 3 段 → 拆成 2 條字幕" in x for x in logs)
+
+
+def test_merge_can_be_turned_off(stub, monkeypatch):
+    monkeypatch.setattr(config, "MERGE_FRAGMENTS", False)
+    stub.model.segments = [
+        seg_with_words(0.0, 0.5, "はい", [("はい", 0.0, 0.5)]),
+        seg_with_words(0.6, 1.0, "ー。", [("ー", 0.6, 0.9), ("。", 0.9, 1.0)]),
+    ]
+    out, logs, _ = stub.run()
+    assert Path(out).read_text(encoding="utf-8").count("-->") == 2 and not any(x.startswith("[合併]") for x in logs)
+
+
+def test_alignment_report_numbers_follow_merged_subtitles(stub, monkeypatch):
+    """合併過的字幕涵蓋好幾個 Whisper 片段：對齊報告的編號要對得上輸出的 SRT。"""
+    monkeypatch.setattr(pipeline, "run_alignment", lambda *a, **k: {
+        **fake_align(None, [{"start": 0, "end": 0}] * 3, None, lambda f: None),
+        "confs": [0.9, 0.05, 0.9], "spans": [[0.0, 0.5], [0.6, 1.0], [3.0, 4.0]], "word_spans": [None] * 3})
+    stub.model.segments = [
+        seg_with_words(0.0, 0.5, "はい", [("はい", 0.0, 0.5)]),
+        seg_with_words(0.6, 1.0, "ー。", [("ー", 0.6, 0.9), ("。", 0.9, 1.0)]),
+        seg_with_words(3.0, 4.0, "次です。", [("次", 3.0, 3.4), ("です", 3.4, 3.9), ("。", 3.9, 4.0)]),
+    ]
+    out, logs, _ = stub.run(use_align=True)
+    assert Path(out).read_text(encoding="utf-8").strip().count("-->") == 2
+    assert any("#1 [" in x and "信心 0.05" in x for x in logs)      # 第二個片段（信心低）併進了 SRT 第 1 條
+
+
 # ---------------- 幻覺過濾與轉錄選項 ----------------
 def test_hallucinated_subtitle_is_dropped_and_reported(stub):
     out, logs, prog = stub.run()

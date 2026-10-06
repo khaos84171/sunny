@@ -95,8 +95,9 @@ def report_alignment(segments: list[dict], subs: list[dict], log_func):
     """
     numbers: dict[int, list[int]] = {}
     for no, sub in enumerate(subs, start=1):
-        if sub.get("src") is not None:
-            numbers.setdefault(sub["src"], []).append(no)
+        # 跨片段合併過的字幕涵蓋好幾個 Whisper 片段（srcs）；沒合併過的只有一個（src）
+        for src in sub.get("srcs") or ([sub["src"]] if sub.get("src") is not None else []):
+            numbers.setdefault(src, []).append(no)
 
     def silent_word(seg) -> str | None:
         """聲音交叉檢查：CTC 說有字、該處卻聽不到聲音的第一個詞（可能是幻覺、聽錯，或對到錯的地方）。"""
