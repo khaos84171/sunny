@@ -16,6 +16,34 @@ def as_pairs(subs):
     return [(round(s["start"], 3), round(s["end"], 3)) for s in subs]
 
 
+# ---------------- extend_end_to_next ----------------
+def test_end_is_extended_to_the_next_start_when_the_gap_is_under_the_limit():
+    subs = subs_from((0.0, 1.0), (2.5, 3.0), (6.0, 7.0))
+    assert timing.extend_end_to_next(subs) == 1
+    assert as_pairs(subs) == [(0.0, 2.5), (2.5, 3.0), (6.0, 7.0)]      # 空隙 1.5 → 延長；空隙 3.0 → 不動；最後一條不動
+
+
+def test_gap_of_exactly_the_limit_is_left_alone(monkeypatch):
+    monkeypatch.setattr(config, "EXTEND_END_TO_NEXT_SEC", 2.0)
+    subs = subs_from((0.0, 1.0), (3.0, 4.0), (5.99, 6.5))
+    timing.extend_end_to_next(subs)
+    assert as_pairs(subs)[0] == (0.0, 1.0)                              # 剛好 2 秒：「不到 2 秒」才延長
+    assert as_pairs(subs)[1] == (3.0, 5.99) and as_pairs(subs)[2] == (5.99, 6.5)   # 4.0→5.99 空隙 1.99 秒：延長
+
+
+def test_overlapping_or_touching_subtitles_are_not_changed():
+    subs = subs_from((0.0, 2.0), (1.5, 3.0), (3.0, 4.0), (4.0, 5.0))
+    assert timing.extend_end_to_next(subs) == 0
+    assert as_pairs(subs) == [(0.0, 2.0), (1.5, 3.0), (3.0, 4.0), (4.0, 5.0)]
+
+
+@pytest.mark.parametrize("off", [0, None])
+def test_extension_is_off_when_the_setting_is_zero_or_none(monkeypatch, off):
+    monkeypatch.setattr(config, "EXTEND_END_TO_NEXT_SEC", off)
+    subs = subs_from((0.0, 1.0), (1.5, 2.0))
+    assert timing.extend_end_to_next(subs) == 0 and as_pairs(subs)[0] == (0.0, 1.0)
+
+
 # ---------------- finalize_aligned_timing ----------------
 def test_short_subtitle_does_not_push_back_the_next_one():
     """「はい」1.00–1.10，下一句 1.20 開始：舊版會把下一句推到 1.30。"""

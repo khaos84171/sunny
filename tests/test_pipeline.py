@@ -66,7 +66,8 @@ def seg_with_words(start, end, text, tokens):
     return seg
 
 
-def test_sentence_split_across_two_whisper_segments_is_merged(stub):
+def test_sentence_split_across_two_whisper_segments_is_merged(stub, monkeypatch):
+    monkeypatch.setattr(config, "EXTEND_END_TO_NEXT_SEC", 0)
     stub.model.segments = [
         seg_with_words(0.0, 1.0, "でもペアの強みって", [("でも", 0.0, 0.3), ("ペア", 0.3, 0.6), ("の", 0.6, 0.7), ("強み", 0.7, 0.9), ("って", 0.9, 1.0)]),
         seg_with_words(1.2, 2.5, "押した後だと思うんですよ。", [("押した", 1.2, 1.6), ("後", 1.6, 1.8), ("だ", 1.8, 1.9), ("と", 1.9, 2.0), ("思う", 2.0, 2.2), ("んです", 2.2, 2.4), ("よ", 2.4, 2.45), ("。", 2.45, 2.5)]),
@@ -78,6 +79,27 @@ def test_sentence_split_across_two_whisper_segments_is_merged(stub):
     assert blocks[0].split("\n")[1] == "00:00:00,000 --> 00:00:02,500"
     assert any(x.startswith("[合併]") and "でもペアの強みって" in x for x in logs)
     assert any("Whisper 原本 3 段 → 拆成 2 條字幕" in x for x in logs)
+
+
+def test_subtitle_end_is_extended_to_the_next_start_when_the_gap_is_small(stub):
+    stub.model.segments = [
+        seg_with_words(0.0, 1.0, "一つ目です。", [("一つ目", 0.0, 0.8), ("です", 0.8, 0.95), ("。", 0.95, 1.0)]),
+        seg_with_words(2.5, 3.5, "二つ目です。", [("二つ目", 2.5, 3.3), ("です", 3.3, 3.45), ("。", 3.45, 3.5)]),     # 空隙 1.5 秒 → 延長
+        seg_with_words(6.0, 7.0, "三つ目です。", [("三つ目", 6.0, 6.8), ("です", 6.8, 6.95), ("。", 6.95, 7.0)]),     # 空隙 2.5 秒 → 不動
+    ]
+    out, _, _ = stub.run()
+    times = [b.split("\n")[1] for b in Path(out).read_text(encoding="utf-8").strip().split("\n\n")]
+    assert times == ["00:00:00,000 --> 00:00:02,500", "00:00:02,500 --> 00:00:03,500", "00:00:06,000 --> 00:00:07,000"]
+
+
+def test_end_extension_can_be_turned_off(stub, monkeypatch):
+    monkeypatch.setattr(config, "EXTEND_END_TO_NEXT_SEC", None)
+    stub.model.segments = [
+        seg_with_words(0.0, 1.0, "一つ目です。", [("一つ目", 0.0, 0.8), ("です", 0.8, 0.95), ("。", 0.95, 1.0)]),
+        seg_with_words(2.5, 3.5, "二つ目です。", [("二つ目", 2.5, 3.3), ("です", 3.3, 3.45), ("。", 3.45, 3.5)]),
+    ]
+    out, _, _ = stub.run()
+    assert Path(out).read_text(encoding="utf-8").count("00:00:01,000") == 1
 
 
 def test_merge_can_be_turned_off(stub, monkeypatch):

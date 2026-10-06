@@ -15,7 +15,7 @@ from .models import Word
 from .separation import separate_vocals
 from .splitter import _ensure_min_display, merge_fragments, split_boundary_mode, split_segment
 from .srt_io import add_leading_blank, format_timestamp, is_blank_text, parse_srt, write_srt
-from .timing import apply_alignment, finalize_aligned_timing, report_alignment
+from .timing import apply_alignment, extend_end_to_next, finalize_aligned_timing, report_alignment
 from .transcribe import build_hotwords, get_model, looks_like_hallucination
 
 
@@ -47,6 +47,7 @@ def align_existing_srt(srt_path: str, media_path: str,
     subs = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],
              "src": i, "aligned": seg["aligned"]} for i, seg in enumerate(segments)]
     finalize_aligned_timing(subs, result["duration"])
+    extend_end_to_next(subs)
     if add_blank:
         add_leading_blank(subs, log_func, origin=result["offset"])
     report_alignment(segments, subs, log_func)
@@ -196,6 +197,7 @@ def process_file(file_path: str, use_sep: bool, use_align: bool, use_split: bool
         finalize_aligned_timing(subs, align_result["duration"])
     elif use_split:
         _ensure_min_display(subs)
+    extend_end_to_next(subs)
     if add_blank:
         add_leading_blank(subs, log_func)
     if align_result is not None:

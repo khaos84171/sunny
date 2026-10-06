@@ -21,6 +21,12 @@ from whisper_app.timing import apply_alignment, finalize_aligned_timing
 KANA = "あいうえおかきくけこさしすせそたちつてとなにぬねの"
 
 
+@pytest.fixture(autouse=True)
+def _no_end_extension(monkeypatch):
+    """這裡量的是每條字幕的結束時間跟標準答案差多少；把結尾延長到下一條開頭會讓它偏離，所以關掉。"""
+    monkeypatch.setattr(config, "EXTEND_END_TO_NEXT_SEC", 0)
+
+
 def build_case(tmp_path, n=14, seed=3, ghost=False, offset=0.0):
     """
     寫出 ref.srt（標準答案）、rough.srt（粗略時間的輸入）、script.json、audio.npy，回傳音訊。

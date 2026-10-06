@@ -139,6 +139,22 @@ def report_alignment(segments: list[dict], subs: list[dict], log_func):
                 print(line)
 
 
+def extend_end_to_next(subs: list[dict]) -> int:
+    """
+    前一條字幕結束後，離下一條開頭不到 config.EXTEND_END_TO_NEXT_SEC 秒的，把結尾延長到下一條的開頭。
+    只往後延長（兩條本來就重疊或剛好接上的不動），最後一條不動。回傳延長了幾條。
+    """
+    limit = config.EXTEND_END_TO_NEXT_SEC
+    if not limit:
+        return 0
+    n = 0
+    for sub, nxt in zip(subs, subs[1:]):
+        if 0 < nxt["start"] - sub["end"] < limit:
+            sub["end"] = nxt["start"]
+            n += 1
+    return n
+
+
 def finalize_aligned_timing(subs: list[dict], duration: float):
     """
     對齊後的後處理：稍微提早出現、不重疊、最短顯示時間、結尾稍微延長。
