@@ -87,17 +87,17 @@ def test_first_run_defaults(make_app):
 
 def test_saved_settings_are_restored(make_app):
     app = make_app({"version": 1, "use_sep": False, "use_align": True, "use_split": False, "add_blank": False,
-                    "hotwords": {"伊沢拓司": True, "クイズ": False, "不存在的詞": True}})
+                    "hotwords": {"伊沢": True, "クイズ": False, "不存在的詞": True}})
     assert (app.use_sep_var.get(), app.use_align_var.get(), app.use_split_var.get(), app.add_blank_var.get()) == (False, True, False, False)
-    assert app.hotword_vars["伊沢拓司"].get() is True and app.hotword_vars["クイズ"].get() is False
-    assert app.hotword_vars["ふくら"].get() is False and app.hotword_vars["東大"].get() is True      # 沒記到的用預設
+    assert app.hotword_vars["伊沢"].get() is True and app.hotword_vars["クイズ"].get() is False
+    assert app.hotword_vars["福良"].get() is False and app.hotword_vars["東大"].get() is True      # 沒記到的用預設
     assert "不存在的詞" not in app.hotword_vars
 
 
 @pytest.mark.parametrize("kw", [dict(raw="{這不是json"), dict(raw="[1,2,3]"), dict(settings={"hotwords": ["a"], "use_sep": "yes"})])
 def test_broken_settings_fall_back_to_defaults(make_app, kw):
     app = make_app(**kw)
-    assert app.use_align_var.get() is True and app.hotword_vars["ふくら"].get() is False and app.hotword_vars["クイズ"].get() is True
+    assert app.use_align_var.get() is True and app.hotword_vars["福良"].get() is False and app.hotword_vars["クイズ"].get() is True
 
 
 def test_change_is_saved_after_a_short_delay(make_app):
@@ -107,7 +107,7 @@ def test_change_is_saved_after_a_short_delay(make_app):
     spin(app.root, 0.8)
     data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
     assert data["version"] == 1 and data["use_split"] is False and data["use_sep"] is True
-    assert data["hotwords"]["クイズ"] is True and data["hotwords"]["ふくら"] is False
+    assert data["hotwords"]["クイズ"] is True and data["hotwords"]["福良"] is False
 
 
 def test_select_all_and_none_saves_only_once(make_app, monkeypatch):
